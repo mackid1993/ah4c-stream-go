@@ -37,6 +37,14 @@
 //             mid-session channel changes.
 //
 // Environment details:
+//   HTTP    — GET HTTP/1.1 with keep-alive / identity-encoding preference
+//             (matches Go's http.Get). Many HDMI encoders (LinkPi observed)
+//             fast-path HTTP/1.1 requests and only enter a full channel-
+//             lock cycle on HTTP/1.0 + Connection: close. Encoder may still
+//             choose chunked transfer-encoding for the streaming body;
+//             connect() detects this and wraps the socket in a Chunked
+//             decoder transparent to the producer. Go's stdlib does this
+//             in net/http for free.
 //   Pipe    — stdout kept at Linux default (~64 KiB). Earlier versions
 //             enlarged via F_SETPIPE_SZ to absorb AH4C's ~1s io.Copy
 //             startup pause, but that 1 MiB fill becomes a fixed startup
@@ -130,15 +138,15 @@ fn main() {
 
     let url = env::args().nth(1).unwrap_or_else(|| { eprintln!("usage: ah4c-stream <url>"); exit(2) });
     let t_conn = Instant::now();
-    let (stream, leftover) = connect(&url).unwrap_or_else(|e| {
+    let (reader, fd) = connect(&url).unwrap_or_else(|e| {
         eprintln!("initial connect failed: {}", e); exit(2)
     });
-    eprintln!("[us={}] connect ok dt_ms={} leftover={}", us(), t_conn.elapsed().as_millis(), leftover.len());
-    STREAM_FD.store(stream.as_raw_fd(), Ordering::Relaxed);
+    eprintln!("[us={}] connect ok dt_ms={}", us(), t_conn.elapsed().as_millis());
+    STREAM_FD.store(fd, Ordering::Relaxed);
 
     let (tx, rx) = sync_channel::<Vec<u8>>(QUEUE_DEPTH);
     let p_url = url.clone();
-    thread::spawn(move || producer(p_url, stream, leftover, tx));
+    thread::spawn(move || producer(p_url, reader, tx));
     thread::spawn(summary_thread);
     consumer(rx);
 }
@@ -325,25 +333,14 @@ fn make_disc_packet(pid: u16) -> [u8; 188] {
     p
 }
 
-fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSender<Vec<u8>>) {
+fn producer(url: String, mut reader: Box<dyn Read + Send>, tx: SyncSender<Vec<u8>>) {
     let mut tsp = TsProc::new();
     let mut last_real = Instant::now();
-
-    if !leftover.is_empty() {
-        let n = leftover.len();
-        BYTES_READ.fetch_add(n as u64, Ordering::Relaxed);
-        LAST_REAL_DATA_US.store(us(), Ordering::Relaxed);
-        eprintln!("[us={}] prod_leftover n={}", us(), n);
-        let processed = tsp.process(&leftover);
-        if !processed.is_empty() && tx.send(processed).is_err() { return; }
-    }
-
     let mut buf = vec![0u8; CHUNK];
-    stream.set_read_timeout(Some(SRC_STALL_RECONNECT)).ok();
     loop {
         if last_real.elapsed() > MAX_UNHEALTHY { return; }
         let t_r = Instant::now();
-        match stream.read(&mut buf) {
+        match reader.read(&mut buf) {
             Ok(n) if n > 0 => {
                 let r_us = t_r.elapsed().as_micros() as u64;
                 if r_us > SLOW_EVENT_MS * 1000 {
@@ -366,16 +363,10 @@ fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSende
                 loop {
                     if last_real.elapsed() > MAX_UNHEALTHY { return; }
                     match connect(&url) {
-                        Ok((s, left)) => {
-                            stream = s;
-                            STREAM_FD.store(stream.as_raw_fd(), Ordering::Relaxed);
-                            stream.set_read_timeout(Some(SRC_STALL_RECONNECT)).ok();
+                        Ok((r, fd)) => {
+                            reader = r;
+                            STREAM_FD.store(fd, Ordering::Relaxed);
                             tsp.mark_discontinuity("tcp_reconnect");
-                            if !left.is_empty() {
-                                LAST_REAL_DATA_US.store(us(), Ordering::Relaxed);
-                                let processed = tsp.process(&left);
-                                if !processed.is_empty() && tx.send(processed).is_err() { return; }
-                            }
                             eprintln!("[us={}] reconnected (disc_pending)", us());
                             break;
                         }
@@ -387,7 +378,119 @@ fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSende
     }
 }
 
-fn connect(url: &str) -> std::io::Result<(TcpStream, Vec<u8>)> {
+// Prepended leftover + raw TcpStream. Leftover from the HTTP header parse
+// is served first, then reads fall through to the socket. Non-chunked path.
+struct RawReader {
+    prefix: Vec<u8>,
+    prefix_pos: usize,
+    stream: TcpStream,
+}
+
+impl Read for RawReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.prefix_pos < self.prefix.len() {
+            let n = (self.prefix.len() - self.prefix_pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.prefix[self.prefix_pos..self.prefix_pos + n]);
+            self.prefix_pos += n;
+            return Ok(n);
+        }
+        self.stream.read(buf)
+    }
+}
+
+// Minimal HTTP/1.1 chunked transfer-encoding decoder (RFC 7230 §4.1).
+// Wire format:
+//   <hex-size>[;chunk-ext]\r\n <size bytes data> \r\n  ... 0\r\n [trailers] \r\n
+// Streaming encoders typically never emit the 0-size terminator (stream
+// is infinite); if they do, we return Ok(0) and the producer reconnects.
+// Leftover from the HTTP header parse may contain the first chunk-size
+// line and/or first chunk's data — folded in via `prefix`.
+struct ChunkedReader {
+    prefix: Vec<u8>,
+    prefix_pos: usize,
+    stream: TcpStream,
+    raw: Vec<u8>,       // bytes pulled from prefix/socket, not yet consumed
+    raw_pos: usize,
+    remaining: usize,   // data bytes left in the current chunk
+    need_trailing_crlf: bool, // after chunk data, two bytes \r\n precede next size
+}
+
+impl ChunkedReader {
+    fn new(stream: TcpStream, leftover: Vec<u8>) -> Self {
+        ChunkedReader {
+            prefix: leftover,
+            prefix_pos: 0,
+            stream,
+            raw: Vec::with_capacity(32 * 1024),
+            raw_pos: 0,
+            remaining: 0,
+            need_trailing_crlf: false,
+        }
+    }
+
+    fn refill(&mut self) -> std::io::Result<()> {
+        self.raw.clear();
+        self.raw_pos = 0;
+        if self.prefix_pos < self.prefix.len() {
+            self.raw.extend_from_slice(&self.prefix[self.prefix_pos..]);
+            self.prefix_pos = self.prefix.len();
+            return Ok(());
+        }
+        let mut tmp = [0u8; 32 * 1024];
+        let n = self.stream.read(&mut tmp)?;
+        if n == 0 { return Err(std::io::Error::new(ErrorKind::UnexpectedEof, "eof in chunked body")); }
+        self.raw.extend_from_slice(&tmp[..n]);
+        Ok(())
+    }
+
+    fn next_byte(&mut self) -> std::io::Result<u8> {
+        if self.raw_pos >= self.raw.len() { self.refill()?; }
+        let b = self.raw[self.raw_pos];
+        self.raw_pos += 1;
+        Ok(b)
+    }
+
+    fn read_size_line(&mut self) -> std::io::Result<usize> {
+        let mut line = Vec::with_capacity(16);
+        loop {
+            let b = self.next_byte()?;
+            if b == b'\n' {
+                if line.last() == Some(&b'\r') { line.pop(); }
+                break;
+            }
+            line.push(b);
+            if line.len() > 256 { return Err(ioerr("chunk size line too long")); }
+        }
+        let text = std::str::from_utf8(&line).map_err(|_| ioerr("chunk size not utf8"))?;
+        let hex = text.split(';').next().unwrap_or("").trim();
+        usize::from_str_radix(hex, 16).map_err(|_| ioerr("chunk size not hex"))
+    }
+}
+
+impl Read for ChunkedReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            if self.need_trailing_crlf {
+                let _ = self.next_byte()?;
+                let _ = self.next_byte()?;
+                self.need_trailing_crlf = false;
+            }
+            let size = self.read_size_line()?;
+            if size == 0 { return Ok(0); }
+            self.remaining = size;
+        }
+        if self.raw_pos >= self.raw.len() { self.refill()?; }
+        let available = self.raw.len() - self.raw_pos;
+        let n = available.min(self.remaining).min(buf.len());
+        buf[..n].copy_from_slice(&self.raw[self.raw_pos..self.raw_pos + n]);
+        self.raw_pos += n;
+        self.remaining -= n;
+        if self.remaining == 0 { self.need_trailing_crlf = true; }
+        Ok(n)
+    }
+}
+
+fn connect(url: &str) -> std::io::Result<(Box<dyn Read + Send>, i32)> {
     let s = url.strip_prefix("http://").ok_or_else(|| ioerr("http:// only"))?;
     let (hp, path) = s.split_once('/').map(|(a, b)| (a.to_string(), format!("/{}", b)))
         .unwrap_or_else(|| (s.to_string(), "/".into()));
@@ -396,12 +499,11 @@ fn connect(url: &str) -> std::io::Result<(TcpStream, Vec<u8>)> {
     let mut stream = TcpStream::connect_timeout(&addr, CONNECT)?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(CONNECT))?;
-    // HTTP/1.1 + keep-alive headers, matching Go's net/http defaults. PR #9
-    // works via http.Get which sends exactly this shape; HTTP/1.0 +
-    // Connection: close triggers a fresh channel-lock cycle on some HDMI
-    // encoders (LinkPi observed: ~5s silence on every cold GET). Streaming
-    // endpoints typically ignore keep-alive semantically (they never end),
-    // but the request shape itself changes encoder-side fast-path behavior.
+    // HTTP/1.1 + keep-alive shape, matching Go's net/http defaults. PR #9
+    // uses http.Get which sends exactly this shape; HTTP/1.0 +
+    // Connection: close triggered a full channel-lock cycle on every
+    // cold GET (LinkPi observed: ~5s silence). If the encoder chooses
+    // Transfer-Encoding: chunked for the body, we decode it below.
     stream.write_all(format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Go-http-client/1.1\r\nAccept-Encoding: identity\r\n\r\n",
         path, hp
@@ -420,21 +522,28 @@ fn connect(url: &str) -> std::io::Result<(TcpStream, Vec<u8>)> {
     let hdr_text = std::str::from_utf8(&hdr).unwrap_or("");
     let first = hdr_text.lines().next().unwrap_or("");
     eprintln!("[us={}] resp_status={}", us(), first.trim());
+    let mut chunked = false;
     for line in hdr_text.lines().skip(1) {
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("transfer-encoding:") || lower.starts_with("content-length:")
             || lower.starts_with("connection:") || lower.starts_with("content-type:") {
             eprintln!("[us={}] resp_header={}", us(), line.trim());
         }
-        // Bail loudly if chunked — we don't decode it and treating raw bytes
-        // as TS would corrupt every chunk-size line into the packet stream.
         if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
-            return Err(ioerr("server uses chunked transfer-encoding; not supported"));
+            chunked = true;
         }
     }
     if !first.contains(" 200 ") { return Err(ioerr(first.trim())); }
-    stream.set_read_timeout(None)?;
-    Ok((stream, leftover))
+    stream.set_read_timeout(Some(SRC_STALL_RECONNECT))?;
+    let fd = stream.as_raw_fd();
+    let reader: Box<dyn Read + Send> = if chunked {
+        eprintln!("[us={}] body=chunked leftover={}", us(), leftover.len());
+        Box::new(ChunkedReader::new(stream, leftover))
+    } else {
+        eprintln!("[us={}] body=raw leftover={}", us(), leftover.len());
+        Box::new(RawReader { prefix: leftover, prefix_pos: 0, stream })
+    };
+    Ok((reader, fd))
 }
 
 // 174 × 188 B = 32,712 B ≈ 32 KiB. Matches PR #9 exactly. v0.2.22

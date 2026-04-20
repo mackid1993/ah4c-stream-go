@@ -1,19 +1,18 @@
 // ah4c-stream (Go port). AH4C CMD-mode streaming shim.
 //
 // Loop: http.Get encoder, io.Copy body → stdout, on EOF reconnect.
-// Pure passthrough — no NULL injection anywhere. DVR's PCR-driven
-// playback runs at wall-clock rate.
+// Pure passthrough — DVR's PCR-driven playback runs at wall-clock.
 //
-// Session 1 is probed: read probeBytes and check elapsed time.
-//   hot  — probe fills in < probeWindow. Encoder is already
-//          delivering tuned content (warm retune). Flush the probe
-//          to stdout and stream session 1 to stdout like any other.
-//   cold — probe slow or early-EOF. Session 1 is pre-deeplink HDMI
-//          junk (idle screen, previous channel, loading). Drain it
-//          to encoder EOF so the deeplink-firing window elapses,
-//          then session 2 streams to stdout.
+// Session 1 is probed. If probeBytes arrives in < probeWindow the
+// encoder is already delivering tuned content (warm retune) — flush
+// the probe and stream session 1 to stdout. Otherwise it's pre-
+// deeplink HDMI junk — discard to EOF and let session 2 be the
+// first real stream.
 //
-// Session 2+ always passes through — matches v0.1.0 behavior.
+// Between sessions we write one 188-byte NULL TS packet. Demuxers
+// drop it and it doubles as a stdout-closed tripwire: if the DVR
+// went away, the write fails EPIPE and we exit so AH4C can release
+// the tuner.
 //
 // LinkPi closes TCP every ~5 s by design; reconnecting is normal.
 // Exit only on stdout write failure or encoder dead for deadBudget.
@@ -33,6 +32,18 @@ const (
 	probeBytes     = 32 * 1024
 	probeWindow    = 500 * time.Millisecond
 )
+
+var nullPacket = func() []byte {
+	p := make([]byte, 188)
+	p[0] = 0x47 // sync
+	p[1] = 0x1F // PID hi
+	p[2] = 0xFF // PID lo → 0x1FFF NULL
+	p[3] = 0x10 // AF_control=01, CC=0
+	for i := 4; i < 188; i++ {
+		p[i] = 0xFF
+	}
+	return p
+}()
 
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
@@ -82,6 +93,9 @@ func main() {
 				resp.Body.Close()
 				log.Printf("session=1 COLD probe_n=%d dt_ms=%d — drained",
 					n, dt.Milliseconds())
+				if _, werr := os.Stdout.Write(nullPacket); werr != nil {
+					return
+				}
 				continue
 			}
 			log.Printf("session=1 HOT probe_n=%d dt_ms=%d — passthrough",
@@ -96,7 +110,11 @@ func main() {
 		resp.Body.Close()
 		log.Printf("session=%d bytes=%d werr=%v", sessions, n, werr)
 		if werr != nil {
-			log.Printf("io.Copy err — exit")
+			log.Printf("stdout closed — exit")
+			return
+		}
+		if _, werr := os.Stdout.Write(nullPacket); werr != nil {
+			log.Printf("stdout closed on probe — exit")
 			return
 		}
 	}

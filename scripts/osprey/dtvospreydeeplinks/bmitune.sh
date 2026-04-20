@@ -14,7 +14,7 @@ adbTarget="adb -s $streamerIP"
 mkdir -p "$streamerNoPort"
 echo $$ > "$streamerNoPort/bmitune_pid"
 
-log() { printf '[bmitune %s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
+log() { printf '[bmitune %s] %s\n' "$(date '+%H:%M:%S')" "$*" > /proc/1/fd/1; }
 
 trap 'log "exit code=$?"' EXIT
 

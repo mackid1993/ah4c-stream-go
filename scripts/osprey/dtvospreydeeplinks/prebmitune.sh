@@ -7,7 +7,7 @@ adbTarget="adb -s $streamerIP"
 
 mkdir -p "$streamerNoPort"
 
-log() { printf '[prebmitune %s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
+log() { printf '[prebmitune %s] %s\n' "$(date '+%H:%M:%S')" "$*" > /proc/1/fd/1; }
 
 trap 'log "exit code=$?"' EXIT
 

@@ -185,11 +185,6 @@ fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSende
                 eprintln!("[us={}] source EOF/error; reconnecting", us());
                 loop {
                     if last_real.elapsed() > MAX_UNHEALTHY { return; }
-                    // Emit a NULL chunk each reconnect iteration (keepalive
-                    // to DVR while we try to re-establish). Matches bash's
-                    // `cat $NULL_FILE; curl $URL` loop.
-                    eprintln!("[us={}] prod_null_emit (reconnect)", us());
-                    if tx.send(null.clone()).is_err() { return; }
                     match connect(&url) {
                         Ok((s, left)) => {
                             stream = s;
@@ -199,7 +194,15 @@ fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSende
                             eprintln!("[us={}] reconnected", us());
                             break;
                         }
-                        Err(_) => thread::sleep(SRC_RECONNECT_BACKOFF),
+                        Err(_) => {
+                            // Emit NULL only after a failed connect attempt — keeps
+                            // DVR fed during real outages, but a fast reconnect
+                            // (encoder glitched for <1s) injects zero NULL bytes
+                            // and the demuxer sees clean continuity.
+                            eprintln!("[us={}] prod_null_emit (reconnect retry)", us());
+                            if tx.send(null.clone()).is_err() { return; }
+                            thread::sleep(SRC_RECONNECT_BACKOFF);
+                        }
                     }
                 }
             }

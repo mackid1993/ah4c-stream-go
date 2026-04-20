@@ -29,7 +29,7 @@ use std::mem::ManuallyDrop;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::process::exit;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::OnceLock;
 use std::thread;
@@ -62,6 +62,11 @@ const CHUNK: usize = 32 * 1024;
 const QUEUE_DEPTH: usize = 256;
 
 static STREAM_FD: AtomicI32 = AtomicI32::new(-1);
+// Consumer stays silent on recv_timeout until producer has sent at least one
+// real-data chunk. Prevents cold-start NULL bursts from poisoning DVR's
+// MPEG-TS demuxer lock-on before the first PAT/PMT arrives — matching bash's
+// behavior where only one keepalive NULL precedes real data.
+static STARTED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_term(_: libc::c_int) {
     let fd = STREAM_FD.load(Ordering::Relaxed);
@@ -151,7 +156,13 @@ fn consumer(rx: Receiver<Vec<u8>>) {
                 BYTES_WRITTEN.fetch_add(n as u64, Ordering::Relaxed);
             }
             Err(RecvTimeoutError::Timeout) => {
-                eprintln!("[us={}] null_inject (500ms stall)", us());
+                if !STARTED.load(Ordering::Relaxed) {
+                    // Cold-start: wait for first real byte before emitting any
+                    // NULL. Demuxer locks onto PAT/PMT cleanly if they arrive
+                    // before any keepalive padding.
+                    continue;
+                }
+                eprintln!("[us={}] null_inject (250ms stall)", us());
                 if out.write_all(&null).is_err() { return; }
             }
             Err(RecvTimeoutError::Disconnected) => return,
@@ -166,6 +177,7 @@ fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSende
         BYTES_READ.fetch_add(n as u64, Ordering::Relaxed);
         eprintln!("[us={}] prod_leftover n={}", us(), n);
         if tx.send(leftover).is_err() { return; }
+        STARTED.store(true, Ordering::Relaxed);
     }
     let mut buf = vec![0u8; CHUNK];
     stream.set_read_timeout(Some(SRC_STALL_RECONNECT)).ok();
@@ -182,6 +194,7 @@ fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSende
                 last_real = Instant::now();
                 let t_s = Instant::now();
                 if tx.send(buf[..n].to_vec()).is_err() { return; }
+                STARTED.store(true, Ordering::Relaxed);
                 let s_us = t_s.elapsed().as_micros() as u64;
                 PROD_BLOCKED_US.fetch_add(s_us, Ordering::Relaxed);
                 if s_us > SLOW_EVENT_MS * 1000 {

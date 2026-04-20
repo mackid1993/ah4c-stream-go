@@ -48,13 +48,18 @@ fn us() -> u64 {
 }
 // ---------------------------------------------------------
 
-const STALL_READ_GAP: Duration = Duration::from_millis(500);
+const STALL_READ_GAP: Duration = Duration::from_millis(250);
 const SRC_STALL_RECONNECT: Duration = Duration::from_secs(5);
 const SRC_RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_UNHEALTHY: Duration = Duration::from_secs(15);
 const CONNECT: Duration = Duration::from_secs(5);
 const CHUNK: usize = 32 * 1024;
-const QUEUE_DEPTH: usize = 2;
+// 256 × 32 KiB = 8 MiB in-process buffer. This is our "fat pipe" since the
+// container caps kernel pipe-max-size at 1 MiB. Channel depth this large only
+// accumulates depth if the consumer can't drain fast enough (i.e. stdout pipe
+// is full) — during cold-start trickle the consumer always drains to empty,
+// so the 250 ms NULL timer still fires and pads DVR's rate.
+const QUEUE_DEPTH: usize = 256;
 
 static STREAM_FD: AtomicI32 = AtomicI32::new(-1);
 
@@ -124,6 +129,9 @@ fn consumer(rx: Receiver<Vec<u8>>) {
                 let actual = libc::fcntl(1, 1032);
                 eprintln!("[us={}] pipe_sz requested={} actual={}", us(), size, actual);
                 break;
+            } else {
+                let err = std::io::Error::last_os_error();
+                eprintln!("[us={}] pipe_sz requested={} DENIED err={}", us(), size, err);
             }
         }
     }
@@ -233,13 +241,15 @@ fn connect(url: &str) -> std::io::Result<(TcpStream, Vec<u8>)> {
 }
 
 fn make_null() -> Vec<u8> {
-    // Single 188-byte NULL packet per 500ms stall event. Minimum viable
-    // keepalive — enough for DVR to see forward progress on the HTTP body,
-    // negligible pipe-depth cost vs the 32 KiB chunk v0.2.12 emitted, which
-    // filled the stdout pipe ahead of real data during cold-start trickle.
-    let mut v = Vec::with_capacity(188);
-    v.extend_from_slice(&[0x47, 0x1F, 0xFF, 0x10]);
-    v.extend(std::iter::repeat(0xFF).take(184));
+    // 174 × 188 B = 32712 B (~32 KiB). Large enough that NULL keepalive
+    // meaningfully pads DVR's observed byte rate past its "stream is too
+    // slow, behind live" threshold during encoder trickle. v0.2.13's 188 B
+    // emission didn't move the needle; reverted.
+    let mut v = Vec::with_capacity(174 * 188);
+    for _ in 0..174 {
+        v.extend_from_slice(&[0x47, 0x1F, 0xFF, 0x10]);
+        v.extend(std::iter::repeat(0xFF).take(184));
+    }
     v
 }
 

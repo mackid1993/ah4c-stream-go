@@ -10,9 +10,12 @@
 //              (stallReadGap) fills the output with MPEG-TS NULL packets.
 //              The 500ms timer is created fresh each recv, so NULLs only
 //              fire after 500ms of actual channel starvation.
-//   Channel  — sync_channel(64), same as PR #9's queueDepth. Not a latency
-//              tax: downstream io.Copy drains at DVR's rate, channel stays
-//              near-empty in steady state.
+//   Channel  — sync_channel(2). PR #9 uses 64 because it's in-process with
+//              DVR and the channel stays near-empty in steady state. In CMD
+//              mode the extra stdout-pipe hop lets AH4C's bursty reads fill
+//              whatever buffer we give it — 64 × 32KB accumulates as PCR lag
+//              visible to DVR. 2 is enough shock absorption against AH4C's
+//              per-read variance without giving depth room to grow.
 //   Pipe     — stdout enlarged to 1 MiB via fcntl F_SETPIPE_SZ so AH4C's
 //              ~1s io.Copy startup pause doesn't cascade backpressure to
 //              the encoder.
@@ -51,7 +54,7 @@ const SRC_RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_UNHEALTHY: Duration = Duration::from_secs(15);
 const CONNECT: Duration = Duration::from_secs(5);
 const CHUNK: usize = 32 * 1024;
-const QUEUE_DEPTH: usize = 64;
+const QUEUE_DEPTH: usize = 2;
 
 static STREAM_FD: AtomicI32 = AtomicI32::new(-1);
 

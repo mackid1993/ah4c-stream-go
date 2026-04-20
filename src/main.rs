@@ -1,23 +1,21 @@
-// ah4c-stream: standalone AH4C CMD-mode tuner. Port of PR #9's
-// stallTolerantReader semantics, two-threaded:
+// ah4c-stream: standalone AH4C CMD-mode tuner. Semantic match to the bash
+// reference (curl + cat-NULL-on-retry); simpler than PR #9's stallTolerantReader.
 //
-//   Producer — encoder socket; 5s per-read timeout. On timeout or EOF,
-//              reconnects with 2s backoff. 15s no-real-bytes budget.
-//   Consumer — 500ms channel-empty timer. On data → stdout. On timeout →
-//              MPEG-TS NULL block to stdout (DVR keepalive).
-//   Channel  — sync_channel(2). PR #9 uses 64 because it's in-process with
-//              DVR; our extra stdout-pipe hop to AH4C already provides shock
-//              absorption via the 64 KiB kernel pipe buffer, so anything
-//              held in this channel is pure added latency.
-//   Cold-path — consumer withholds NULL injection until the first real
-//              chunk has been forwarded. Leading NULLs before the stream's
-//              first PAT/PMT desync the DVR demuxer and delay audio lock-on
-//              by ~10s on cold tune.
+//   Producer — encoder socket. Read with a 1s poll timeout (to allow the
+//              MAX_UNHEALTHY check to run); read-timeouts are non-fatal and
+//              the producer just loops back. On EOF or real I/O error the
+//              producer enters a reconnect loop that emits one NULL chunk
+//              per iteration (matches bash's `cat $NULL_FILE; curl $URL`).
+//   Consumer — forwards channel bytes to stdout (raw fd 1, bypassing
+//              LineWriter). No in-stream NULL injection — NULLs only flow
+//              during the producer's reconnect phase. This avoids the
+//              ~10s audio desync caused by NULL floods interleaved with
+//              cold-start encoder trickle.
+//   Channel  — sync_channel(2). Minimal latency; AH4C's stdin pipe (enlarged
+//              to 1 MiB via fcntl F_SETPIPE_SZ) is the real shock absorber
+//              against AH4C's ~1s startup pause to DVR.
 //   Teardown — SIGTERM/INT/HUP handler shutdown()s the encoder socket before
-//              _exit(0), so the kernel sends FIN (not RST) to the encoder.
-//              Some encoders enter a degraded state after RST and serve
-//              stale/buffered data on the next connect — manifests as
-//              "second tune falls behind timeline."
+//              _exit so the kernel sends FIN (not RST) to the encoder.
 
 use std::env;
 use std::io::{ErrorKind, Read, Write};
@@ -26,7 +24,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::process::exit;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -44,11 +42,10 @@ fn us() -> u64 {
 }
 // ---------------------------------------------------------
 
-const STALL_READ_GAP: Duration = Duration::from_millis(500);
-const SRC_STALL_RECONNECT: Duration = Duration::from_secs(5);
+const READ_POLL: Duration = Duration::from_secs(1);
 const SRC_RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_UNHEALTHY: Duration = Duration::from_secs(15);
-const CONNECT: Duration = Duration::from_secs(5);
+const CONNECT: Duration = Duration::from_secs(2);
 const CHUNK: usize = 32 * 1024;
 const QUEUE_DEPTH: usize = 2;
 
@@ -112,23 +109,16 @@ fn summary_thread() {
 }
 
 fn consumer(rx: Receiver<Vec<u8>>) {
-    let null = make_null();
     // Bypass std::io::stdout()'s LineWriter — it buffers binary data (no \n)
     // up to 8 KiB, adding read-size-dependent latency. Raw fd 1 goes straight
     // to write(2) per call, same as Perl's syswrite. ManuallyDrop so the
     // File's Drop doesn't close fd 1 on scope exit.
     let mut out = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(1) });
-    // Enlarge stdout pipe buffer to 1 MiB (default is 64 KiB). AH4C's io.Copy
-    // to DVR blocks for ~1s at startup (per instrumentation in v0.2.6). With a
-    // 64 KiB pipe, that block cascades: our write_all blocks → producer blocks
-    // on tx.send → producer stops reading socket → kernel TCP window closes →
-    // encoder goes silent for ~3s → NULL storm fires every 500 ms → DVR
-    // demuxer resyncs → 10s audio lock-on. 1 MiB absorbs AH4C's startup pause
-    // so nothing cascades. Kernel cap is /proc/sys/fs/pipe-max-size (usually
-    // 1 MiB in containers). Best-effort; ignore failure.
-    // F_SETPIPE_SZ = 1031, F_GETPIPE_SZ = 1032. Try descending sizes; kernel
-    // caps at /proc/sys/fs/pipe-max-size (1 MiB default). Take the largest
-    // that's accepted.
+    // Enlarge stdout pipe buffer. AH4C's io.Copy to DVR pauses for ~1s at
+    // startup; a default 64 KiB pipe would force our write_all to block, which
+    // cascades backpressure to the encoder. 1 MiB absorbs the pause. Kernel
+    // caps at /proc/sys/fs/pipe-max-size. F_SETPIPE_SZ = 1031, F_GETPIPE_SZ
+    // = 1032. Try descending sizes; take the largest that's accepted.
     unsafe {
         for size in [8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 1024 * 1024].iter() {
             if libc::fcntl(1, 1031, *size as libc::c_int) >= 0 {
@@ -138,17 +128,9 @@ fn consumer(rx: Receiver<Vec<u8>>) {
             }
         }
     }
-    let mut started = false;
     loop {
-        let t_recv = Instant::now();
-        match rx.recv_timeout(STALL_READ_GAP) {
+        match rx.recv() {
             Ok(data) => {
-                let recv_us = t_recv.elapsed().as_micros() as u64;
-                CONS_BLOCKED_US.fetch_add(recv_us, Ordering::Relaxed);
-                if recv_us > SLOW_EVENT_MS * 1000 {
-                    eprintln!("[us={}] cons_recv_slow n={} dt_ms={}", us(), data.len(), recv_us / 1000);
-                }
-                started = true;
                 let n = data.len();
                 let t_w = Instant::now();
                 if out.write_all(&data).is_err() { return; }
@@ -158,18 +140,14 @@ fn consumer(rx: Receiver<Vec<u8>>) {
                 }
                 BYTES_WRITTEN.fetch_add(n as u64, Ordering::Relaxed);
             }
-            Err(RecvTimeoutError::Timeout) => {
-                if !started { continue; }
-                eprintln!("[us={}] null_inject (500ms stall)", us());
-                if out.write_all(&null).is_err() { return; }
-            }
-            Err(RecvTimeoutError::Disconnected) => return,
+            Err(_) => return,
         }
     }
 }
 
 fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSender<Vec<u8>>) {
     let mut last_real = Instant::now();
+    let null = make_null();
     if !leftover.is_empty() {
         let n = leftover.len();
         BYTES_READ.fetch_add(n as u64, Ordering::Relaxed);
@@ -177,9 +155,9 @@ fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSende
         if tx.send(leftover).is_err() { return; }
     }
     let mut buf = vec![0u8; CHUNK];
+    stream.set_read_timeout(Some(READ_POLL)).ok();
     loop {
         if last_real.elapsed() > MAX_UNHEALTHY { return; }
-        stream.set_read_timeout(Some(SRC_STALL_RECONNECT)).ok();
         let t_r = Instant::now();
         match stream.read(&mut buf) {
             Ok(n) if n > 0 => {
@@ -197,16 +175,28 @@ fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSende
                     eprintln!("[us={}] prod_send_slow n={} dt_ms={}", us(), n, s_us / 1000);
                 }
             }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                // Read poll expired — socket alive but no data. Match bash's
+                // curl-blocks-forever: just loop back and keep waiting. The
+                // MAX_UNHEALTHY check at the top of the loop is the safety net.
+                continue;
+            }
             _ => {
-                eprintln!("source idle/error; reconnecting");
+                eprintln!("[us={}] source EOF/error; reconnecting", us());
                 loop {
                     if last_real.elapsed() > MAX_UNHEALTHY { return; }
+                    // Emit a NULL chunk each reconnect iteration (keepalive
+                    // to DVR while we try to re-establish). Matches bash's
+                    // `cat $NULL_FILE; curl $URL` loop.
+                    eprintln!("[us={}] prod_null_emit (reconnect)", us());
+                    if tx.send(null.clone()).is_err() { return; }
                     match connect(&url) {
                         Ok((s, left)) => {
                             stream = s;
                             STREAM_FD.store(stream.as_raw_fd(), Ordering::Relaxed);
+                            stream.set_read_timeout(Some(READ_POLL)).ok();
                             if !left.is_empty() && tx.send(left).is_err() { return; }
-                            eprintln!("reconnected");
+                            eprintln!("[us={}] reconnected", us());
                             break;
                         }
                         Err(_) => thread::sleep(SRC_RECONNECT_BACKOFF),

@@ -396,7 +396,16 @@ fn connect(url: &str) -> std::io::Result<(TcpStream, Vec<u8>)> {
     let mut stream = TcpStream::connect_timeout(&addr, CONNECT)?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(CONNECT))?;
-    stream.write_all(format!("GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n", path, hp).as_bytes())?;
+    // HTTP/1.1 + keep-alive headers, matching Go's net/http defaults. PR #9
+    // works via http.Get which sends exactly this shape; HTTP/1.0 +
+    // Connection: close triggers a fresh channel-lock cycle on some HDMI
+    // encoders (LinkPi observed: ~5s silence on every cold GET). Streaming
+    // endpoints typically ignore keep-alive semantically (they never end),
+    // but the request shape itself changes encoder-side fast-path behavior.
+    stream.write_all(format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Go-http-client/1.1\r\nAccept-Encoding: identity\r\n\r\n",
+        path, hp
+    ).as_bytes())?;
 
     let mut hdr = Vec::with_capacity(1024);
     let mut tmp = [0u8; 1024];
@@ -408,7 +417,21 @@ fn connect(url: &str) -> std::io::Result<(TcpStream, Vec<u8>)> {
         if hdr.len() > 8192 { return Err(ioerr("headers too large")); }
     };
     let leftover = hdr.split_off(end + 4);
-    let first = std::str::from_utf8(&hdr).unwrap_or("").lines().next().unwrap_or("");
+    let hdr_text = std::str::from_utf8(&hdr).unwrap_or("");
+    let first = hdr_text.lines().next().unwrap_or("");
+    eprintln!("[us={}] resp_status={}", us(), first.trim());
+    for line in hdr_text.lines().skip(1) {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("transfer-encoding:") || lower.starts_with("content-length:")
+            || lower.starts_with("connection:") || lower.starts_with("content-type:") {
+            eprintln!("[us={}] resp_header={}", us(), line.trim());
+        }
+        // Bail loudly if chunked — we don't decode it and treating raw bytes
+        // as TS would corrupt every chunk-size line into the packet stream.
+        if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
+            return Err(ioerr("server uses chunked transfer-encoding; not supported"));
+        }
+    }
     if !first.contains(" 200 ") { return Err(ioerr(first.trim())); }
     stream.set_read_timeout(None)?;
     Ok((stream, leftover))

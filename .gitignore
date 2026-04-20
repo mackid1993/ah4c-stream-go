@@ -10,3 +10,6 @@
 
 # macOS noise
 .DS_Store
+
+# Old binaries
+/ah4c-stream.old

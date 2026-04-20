@@ -1,41 +1,50 @@
-// ah4c-stream: standalone AH4C CMD-mode tuner. Literal port of PR #9's
-// stallTolerantReader from sullrich/ah4c (main.go:1337-1529).
+// ah4c-stream: standalone AH4C CMD-mode tuner. Port of PR #9's
+// stallTolerantReader from sullrich/ah4c (main.go:1337-1529), plus MPEG-TS
+// packet-level discontinuity_indicator flagging on reconnect.
 //
+// PR #9 semantics (literal):
 //   Producer — encoder socket. 5s per-read timeout (srcStallReconnect).
-//              On ANY non-data outcome (Ok(0), read timeout, or other I/O
-//              error) the producer closes the body and enters a reconnect
-//              loop that retries silently with 2s backoff — no NULL
-//              emission, producer never writes NULLs.
+//              ANY non-data outcome (Ok(0), timeout, error) closes body and
+//              reconnects silently with 2s backoff. No NULL emission here.
 //   Consumer — forwards channel bytes to stdout. On 500ms channel-empty
-//              (stallReadGap) fills the output with MPEG-TS NULL packets.
-//              The 500ms timer is created fresh each recv, so NULLs only
-//              fire after 500ms of actual channel starvation.
-//   Channel  — sync_channel(2). PR #9 uses 64 because it's in-process with
-//              DVR and the channel stays near-empty in steady state. In CMD
-//              mode the extra stdout-pipe hop lets AH4C's bursty reads fill
-//              whatever buffer we give it — 64 × 32KB accumulates as PCR lag
-//              visible to DVR. 2 is enough shock absorption against AH4C's
-//              per-read variance without giving depth room to grow.
-//   Pipe     — stdout enlarged to 1 MiB via fcntl F_SETPIPE_SZ so AH4C's
-//              ~1s io.Copy startup pause doesn't cascade backpressure to
-//              the encoder.
-//   Teardown — SIGTERM/INT/HUP handler shutdown()s the encoder socket
-//              before _exit so the kernel sends FIN (not RST) to the
-//              encoder.
+//              (stallReadGap) fills with MPEG-TS NULL packets. Timer resets
+//              each recv. No STARTED gate, no consecutive-NULL cap; those
+//              divergences (v0.2.14–v0.2.16) caused more issues than they
+//              solved and aren't part of PR #9.
+//   Channel  — sync_channel(64), matching PR #9.
+//
+// Beyond PR #9 — required because CMD-mode topology (extra kernel pipe +
+// Go io.Pipe hop between us and DVR) adds enough serialization that the
+// encoder's FIN/reconnect-with-~3s-silence pattern produces a PCR jump the
+// in-process reader never caused:
+//
+//   TsProc  — 188-byte-packet-aware wrapper around the byte stream. On
+//             each reconnect, marks `disc_pending`; then flags
+//             adaptation_field.discontinuity_indicator=1 on the first
+//             AF-bearing packet per PID after reconnect. This is the
+//             MPEG-TS primitive for "PCR jumped, rebase STC" — telling
+//             DVR's demuxer the post-reconnect clock is a restart, not a
+//             stale stream. Fixes audio cut / A/V desync on cold tunes.
+//
+// Environment details:
+//   Pipe    — stdout enlarged via fcntl F_SETPIPE_SZ (cascade 8→4→2→1 MiB;
+//             container caps at 1 MiB without CAP_SYS_RESOURCE).
+//   Teardown— SIGTERM/INT/HUP handler shutdown()s the encoder socket before
+//             _exit so the kernel sends FIN (not RST) to the encoder.
 
+use std::collections::HashSet;
 use std::env;
 use std::io::{ErrorKind, Read, Write};
 use std::mem::ManuallyDrop;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::process::exit;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
-// ---------- diagnostic instrumentation (v0.2.6) ----------
 static T0: OnceLock<Instant> = OnceLock::new();
 static BYTES_READ: AtomicU64 = AtomicU64::new(0);
 static BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
@@ -46,35 +55,16 @@ static SLOW_EVENT_MS: u64 = 10;
 fn us() -> u64 {
     T0.get_or_init(Instant::now).elapsed().as_micros() as u64
 }
-// ---------------------------------------------------------
 
-const STALL_READ_GAP: Duration = Duration::from_millis(250);
+const STALL_READ_GAP: Duration = Duration::from_millis(500);
 const SRC_STALL_RECONNECT: Duration = Duration::from_secs(5);
 const SRC_RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_UNHEALTHY: Duration = Duration::from_secs(15);
 const CONNECT: Duration = Duration::from_secs(5);
 const CHUNK: usize = 32 * 1024;
-// Cap on consecutive NULL emissions when no real data arrives between them.
-// 3 × 32 KiB = 96 KiB of padding per stall cluster — enough to bridge short
-// encoder hiccups at DVR's live rate, short enough that extended silence
-// (like cold-start where encoder sends 1.3s of trickle then pauses 3s) no
-// longer dumps ~512 KiB of NULL into the pipe and starves DVR's audio
-// decoder. Counter resets on any real-data chunk, matching bash's behavior
-// where NULL emission happens only at connection boundaries.
-const MAX_CONSECUTIVE_NULLS: u32 = 3;
-// 256 × 32 KiB = 8 MiB in-process buffer. This is our "fat pipe" since the
-// container caps kernel pipe-max-size at 1 MiB. Channel depth this large only
-// accumulates depth if the consumer can't drain fast enough (i.e. stdout pipe
-// is full) — during cold-start trickle the consumer always drains to empty,
-// so the 250 ms NULL timer still fires and pads DVR's rate.
-const QUEUE_DEPTH: usize = 256;
+const QUEUE_DEPTH: usize = 64;
 
 static STREAM_FD: AtomicI32 = AtomicI32::new(-1);
-// Consumer stays silent on recv_timeout until producer has sent at least one
-// real-data chunk. Prevents cold-start NULL bursts from poisoning DVR's
-// MPEG-TS demuxer lock-on before the first PAT/PMT arrives — matching bash's
-// behavior where only one keepalive NULL precedes real data.
-static STARTED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_term(_: libc::c_int) {
     let fd = STREAM_FD.load(Ordering::Relaxed);
@@ -148,11 +138,9 @@ fn consumer(rx: Receiver<Vec<u8>>) {
             }
         }
     }
-    let mut nulls_in_a_row: u32 = 0;
     loop {
         match rx.recv_timeout(STALL_READ_GAP) {
             Ok(data) => {
-                nulls_in_a_row = 0;
                 let n = data.len();
                 let t_w = Instant::now();
                 if out.write_all(&data).is_err() { return; }
@@ -163,14 +151,7 @@ fn consumer(rx: Receiver<Vec<u8>>) {
                 BYTES_WRITTEN.fetch_add(n as u64, Ordering::Relaxed);
             }
             Err(RecvTimeoutError::Timeout) => {
-                if !STARTED.load(Ordering::Relaxed) {
-                    continue;
-                }
-                if nulls_in_a_row >= MAX_CONSECUTIVE_NULLS {
-                    continue;
-                }
-                nulls_in_a_row += 1;
-                eprintln!("[us={}] null_inject ({}/{})", us(), nulls_in_a_row, MAX_CONSECUTIVE_NULLS);
+                eprintln!("[us={}] null_inject (500ms stall)", us());
                 if out.write_all(&null).is_err() { return; }
             }
             Err(RecvTimeoutError::Disconnected) => return,
@@ -178,15 +159,93 @@ fn consumer(rx: Receiver<Vec<u8>>) {
     }
 }
 
+struct TsProc {
+    carry: Vec<u8>,
+    synced: bool,
+    disc_pending: bool,
+    flagged_pids: HashSet<u16>,
+}
+
+impl TsProc {
+    fn new() -> Self {
+        TsProc {
+            carry: Vec::with_capacity(4096),
+            synced: false,
+            disc_pending: false,
+            flagged_pids: HashSet::new(),
+        }
+    }
+
+    fn mark_reconnect(&mut self) {
+        self.disc_pending = true;
+        self.flagged_pids.clear();
+    }
+
+    fn process(&mut self, data: &[u8]) -> Vec<u8> {
+        self.carry.extend_from_slice(data);
+
+        if !self.synced {
+            if let Some(pos) = self.carry.iter().position(|&b| b == 0x47) {
+                if pos > 0 { self.carry.drain(..pos); }
+                self.synced = true;
+            } else {
+                self.carry.clear();
+                return Vec::new();
+            }
+        }
+
+        let mut out = Vec::with_capacity(self.carry.len());
+        while self.carry.len() >= 188 {
+            if self.carry[0] != 0x47 {
+                self.synced = false;
+                if let Some(pos) = self.carry.iter().position(|&b| b == 0x47) {
+                    self.carry.drain(..pos);
+                    self.synced = true;
+                    continue;
+                } else {
+                    self.carry.clear();
+                    break;
+                }
+            }
+            let mut packet: [u8; 188] = [0; 188];
+            packet.copy_from_slice(&self.carry[..188]);
+            self.maybe_flag_disc(&mut packet);
+            out.extend_from_slice(&packet);
+            self.carry.drain(..188);
+        }
+        out
+    }
+
+    fn maybe_flag_disc(&mut self, packet: &mut [u8; 188]) {
+        if !self.disc_pending { return; }
+        let pid = ((packet[1] as u16 & 0x1F) << 8) | (packet[2] as u16);
+        if pid == 0x1FFF { return; }
+        if self.flagged_pids.contains(&pid) { return; }
+        // adaptation_field_control is byte 3 bits 5..4. 10 = AF only,
+        // 11 = AF + payload. Both have an AF we can flag.
+        let af_control = (packet[3] >> 4) & 0x3;
+        if af_control != 0b10 && af_control != 0b11 { return; }
+        let af_length = packet[4];
+        if af_length == 0 { return; }
+        // Byte 5 = AF flags. Bit 7 (0x80) = discontinuity_indicator.
+        packet[5] |= 0x80;
+        self.flagged_pids.insert(pid);
+        eprintln!("[us={}] disc_flag pid=0x{:04X}", us(), pid);
+    }
+}
+
 fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSender<Vec<u8>>) {
+    let mut tsp = TsProc::new();
     let mut last_real = Instant::now();
+
     if !leftover.is_empty() {
         let n = leftover.len();
         BYTES_READ.fetch_add(n as u64, Ordering::Relaxed);
         eprintln!("[us={}] prod_leftover n={}", us(), n);
-        if tx.send(leftover).is_err() { return; }
-        STARTED.store(true, Ordering::Relaxed);
+        let processed = tsp.process(&leftover);
+        if !processed.is_empty() && tx.send(processed).is_err() { return; }
     }
+
     let mut buf = vec![0u8; CHUNK];
     stream.set_read_timeout(Some(SRC_STALL_RECONNECT)).ok();
     loop {
@@ -201,8 +260,8 @@ fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSende
                 BYTES_READ.fetch_add(n as u64, Ordering::Relaxed);
                 last_real = Instant::now();
                 let t_s = Instant::now();
-                if tx.send(buf[..n].to_vec()).is_err() { return; }
-                STARTED.store(true, Ordering::Relaxed);
+                let processed = tsp.process(&buf[..n]);
+                if !processed.is_empty() && tx.send(processed).is_err() { return; }
                 let s_us = t_s.elapsed().as_micros() as u64;
                 PROD_BLOCKED_US.fetch_add(s_us, Ordering::Relaxed);
                 if s_us > SLOW_EVENT_MS * 1000 {
@@ -210,10 +269,6 @@ fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSende
                 }
             }
             _ => {
-                // PR #9: ANY non-data outcome (Ok(0), 5s timeout, real error)
-                // → close body, reconnect silently with 2s backoff. Producer
-                // never emits NULLs; the consumer's 500ms timer handles
-                // DVR keepalive during the channel starvation that results.
                 eprintln!("[us={}] source idle/error; reconnecting", us());
                 loop {
                     if last_real.elapsed() > MAX_UNHEALTHY { return; }
@@ -222,8 +277,12 @@ fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSende
                             stream = s;
                             STREAM_FD.store(stream.as_raw_fd(), Ordering::Relaxed);
                             stream.set_read_timeout(Some(SRC_STALL_RECONNECT)).ok();
-                            if !left.is_empty() && tx.send(left).is_err() { return; }
-                            eprintln!("[us={}] reconnected", us());
+                            tsp.mark_reconnect();
+                            if !left.is_empty() {
+                                let processed = tsp.process(&left);
+                                if !processed.is_empty() && tx.send(processed).is_err() { return; }
+                            }
+                            eprintln!("[us={}] reconnected (disc_pending)", us());
                             break;
                         }
                         Err(_) => thread::sleep(SRC_RECONNECT_BACKOFF),
@@ -262,10 +321,6 @@ fn connect(url: &str) -> std::io::Result<(TcpStream, Vec<u8>)> {
 }
 
 fn make_null() -> Vec<u8> {
-    // 174 × 188 B = 32712 B (~32 KiB). Large enough that NULL keepalive
-    // meaningfully pads DVR's observed byte rate past its "stream is too
-    // slow, behind live" threshold during encoder trickle. v0.2.13's 188 B
-    // emission didn't move the needle; reverted.
     let mut v = Vec::with_capacity(174 * 188);
     for _ in 0..174 {
         v.extend_from_slice(&[0x47, 0x1F, 0xFF, 0x10]);

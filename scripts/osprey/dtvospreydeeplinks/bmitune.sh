@@ -1,9 +1,11 @@
 #!/bin/bash
 # bmitune.sh for osprey/dtvospreydeeplinks
-# Spawns a nohup prober.sh (like keep_watching) that polls the encoder
-# until real video is flowing, then fires the deep link. Because it's
-# nohup'd, it survives stopbmitune — bmitune can be killed off while
-# the prober keeps going, and the deep link still lands.
+# Fire-then-verify: fire the deep link, then probe the encoder to
+# confirm real video is flowing. Retry up to 3 times on no-lock.
+#
+# The old probe-then-fire ordering chicken-and-egg'd: the encoder
+# never produces >500 KB/s until the deep link IS fired, so a probe
+# waiting for bytes would wait forever.
 #
 # AH4C passes:  $1 = channel (name~id)   $2 = tunerIP
 
@@ -35,34 +37,34 @@ matchEncoderURL() {
   esac
 }
 
-# Write a prober script that probes the encoder until real video
-# (>500 KB/s) is flowing, then fires the deeplink. nohup it so it
-# survives stopbmitune. Same pattern as keep_watching.
-spawnProber() {
-  [[ -z "$encoderURL" ]] && { log "no encoderURL mapped — skipping prober"; return; }
-  cat > "./$streamerNoPort/prober.sh" <<EOF
-#!/bin/bash
-lg() { echo "[prober \$(date '+%H:%M:%S')] \$*" > /proc/1/fd/1; }
-lg "start probing $encoderURL for live video (>500 KB/s)"
-i=0
-while (( i < 60 )); do
-  (( i++ ))
-  bytes=\$(timeout 1 curl -sN "$encoderURL" 2>/dev/null | wc -c)
-  if (( bytes > 500000 )); then
-    lg "encoder LIVE on probe \$i (\$bytes bytes) — firing deeplink"
-    $adbTarget shell "am start -a android.intent.action.VIEW -d 'https://deeplink.directvnow.com/tune/live/channel/$channelName/$channelID' com.att.tv.openvideo"
-    lg "deeplink fired — exiting prober"
-    exit 0
-  fi
-  lg "probe \$i teeny (\$bytes bytes) — sleep 1"
-  sleep 1
-done
-lg "TIMEOUT after \$i probes — giving up"
-EOF
-  chmod +x "./$streamerNoPort/prober.sh"
-  nohup "./$streamerNoPort/prober.sh" > /dev/null 2>&1 &
-  echo $! > "./$streamerNoPort/prober_pid"
-  log "prober spawned PID $(cat ./$streamerNoPort/prober_pid)"
+fireDeepLink() {
+  log "firing deeplink: $channelName/$channelID → $streamerIP"
+  $adbTarget shell "am start -a android.intent.action.VIEW -d 'https://deeplink.directvnow.com/tune/live/channel/$channelName/$channelID' com.att.tv.openvideo"
+}
+
+# Fire deeplink, then probe encoder for up to 12s to verify lock.
+# Retry up to 3 times if we never see real video flowing.
+tuneAndVerify() {
+  [[ -z "$encoderURL" ]] && { log "no encoderURL mapped — firing once, no verify"; fireDeepLink; return; }
+  local attempt
+  for attempt in 1 2 3; do
+    log "attempt $attempt: firing deeplink"
+    fireDeepLink
+    local probe
+    for probe in 1 2 3 4 5 6 7 8 9 10 11 12; do
+      sleep 1
+      local bytes
+      bytes=$(timeout 1 curl -sN "$encoderURL" 2>/dev/null | wc -c)
+      if (( bytes > 500000 )); then
+        log "LOCKED on attempt $attempt probe $probe ($bytes bytes)"
+        return 0
+      fi
+      log "attempt $attempt probe $probe: $bytes bytes"
+    done
+    log "attempt $attempt: no lock after 12s — re-firing"
+  done
+  log "gave up after 3 attempts"
+  return 1
 }
 
 startKeepAlive() {
@@ -81,6 +83,6 @@ EOF
 
 log "start channel=$channelName/$channelID streamerIP=$streamerIP"
 matchEncoderURL
-spawnProber
+tuneAndVerify
 startKeepAlive
 log "done"

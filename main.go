@@ -18,7 +18,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -209,19 +208,16 @@ func logger(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 }
 
-// httpClient with a 5s dial timeout so initial connect fails fast on a
-// dead encoder (matches Go net/http's behavior in tune() plus a cap —
-// Linux's default SYN retransmit is ~2 minutes without a timeout).
-var httpClient = &http.Client{
-	Transport: &http.Transport{
-		DialContext:           (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
-		ResponseHeaderTimeout: 5 * time.Second,
-		DisableCompression:    true,
-	},
-}
-
+// fetch mirrors what tune() does in main.go before wrapping the body in
+// stallTolerantReader: plain http.Get, 200-or-error. http.DefaultClient
+// has no timeouts, which matches PR #9 exactly — the only bound on a
+// slow-recovering encoder is the producer's 15 s maxUnhealthyDuration
+// budget. Previously a custom client with 5 s dial and 5 s response-
+// header timeouts was causing reconnects to fail before an encoder mid-
+// reboot could finish responding, blowing the budget and EOFing the
+// stream prematurely.
 func fetch(u string) (io.ReadCloser, error) {
-	resp, err := httpClient.Get(u)
+	resp, err := http.Get(u)
 	if err != nil {
 		return nil, err
 	}
@@ -248,11 +244,12 @@ func main() {
 	encoderURL := os.Args[1]
 	label := labelFor(encoderURL)
 
-	// Initial fetch — must succeed or exit 2, matching Go tune()
-	// returning "device(s) not available" for a dead encoder.
+	// Initial fetch — match tune()'s fail-fast semantics. A dead encoder
+	// must surface as exit 2 with zero stdout bytes so AH4C reports the
+	// tune as failed rather than streaming NULLs for 15 s and then EOF.
 	body, err := fetch(encoderURL)
 	if err != nil {
-		logger("[%s] initial connect failed: %v", label, err)
+		logger("[%s] initial fetch failed: %v", label, err)
 		os.Exit(2)
 	}
 
@@ -263,7 +260,7 @@ func main() {
 	reader := newStallTolerantReader(body, reconnectFn, label)
 	defer reader.Close()
 
-	// Forward to stdout. Returns when the reader closes (budget expired,
-	// etc.) or stdout errors (downstream closed).
+	// Pump to stdout. Returns when the reader closes (budget expired) or
+	// stdout errors (downstream / AH4C closed the pipe).
 	_, _ = io.Copy(os.Stdout, reader)
 }

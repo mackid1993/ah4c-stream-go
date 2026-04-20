@@ -4,33 +4,24 @@
 // Pure passthrough — no NULL injection anywhere. DVR's PCR-driven
 // playback runs at wall-clock rate.
 //
-// Cold vs hot detection by intrinsic bitrate. Until one session
-// commits hot, each session starts with a probeBytes read: if it
-// fills in < probeWindow the encoder is delivering tuned content
-// (warm retune or fresh post-deeplink) — flush the probe to stdout
-// and commit to passthrough. Otherwise (slow fill or early EOF) the
-// session is pre-deeplink HDMI junk (idle screen, previous channel,
-// loading) — drain it to /dev/null and try the next session. Once
-// committed, every session flows straight to stdout. No state file,
-// no /tmp pollution, no multi-tuner collision.
+// Session 1 is probed: read probeBytes and check elapsed time.
+//   hot  — probe fills in < probeWindow. Encoder is already
+//          delivering tuned content (warm retune). Flush the probe
+//          to stdout and stream session 1 to stdout like any other.
+//   cold — probe slow or early-EOF. Session 1 is pre-deeplink HDMI
+//          junk (idle screen, previous channel, loading). Drain it
+//          to encoder EOF so the deeplink-firing window elapses,
+//          then session 2 streams to stdout.
 //
-// This skips pre-deeplink junk on a cold tune (prevents the DVR's
-// catch-up fast-play) while preserving the full first session on a
-// warm retune.
-//
-// Teardown: client Timeout, dial Timeout, and ResponseHeaderTimeout
-// guarantee a hung encoder fails fast so this process exits and
-// AH4C releases the tuner.
+// Session 2+ always passes through — matches v0.1.0 behavior.
 //
 // LinkPi closes TCP every ~5 s by design; reconnecting is normal.
-// Exit only on unrecoverable: stdout write failure or encoder dead
-// for deadBudget.
+// Exit only on stdout write failure or encoder dead for deadBudget.
 package main
 
 import (
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"time"
@@ -43,16 +34,6 @@ const (
 	probeWindow    = 500 * time.Millisecond
 )
 
-var client = &http.Client{
-	Timeout: 60 * time.Second,
-	Transport: &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout: 3 * time.Second,
-		}).DialContext,
-		ResponseHeaderTimeout: 10 * time.Second,
-	},
-}
-
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	log.SetOutput(os.Stderr)
@@ -64,12 +45,11 @@ func main() {
 	log.Printf("start url=%s", url)
 
 	lastGood := time.Now()
-	committed := false
 	sessions := 0
 	for {
 		sessions++
 		tGet := time.Now()
-		resp, err := client.Get(url)
+		resp, err := http.Get(url)
 		if err != nil {
 			log.Printf("session=%d get_err=%v", sessions, err)
 			if time.Since(lastGood) > deadBudget {
@@ -91,7 +71,7 @@ func main() {
 			time.Since(tGet).Milliseconds())
 		lastGood = time.Now()
 
-		if !committed {
+		if sessions == 1 {
 			probe := make([]byte, probeBytes)
 			t0 := time.Now()
 			n, rerr := io.ReadFull(resp.Body, probe)
@@ -100,13 +80,12 @@ func main() {
 			if !hot {
 				io.Copy(io.Discard, resp.Body)
 				resp.Body.Close()
-				log.Printf("session=%d COLD probe_n=%d dt_ms=%d — drained",
-					sessions, n, dt.Milliseconds())
+				log.Printf("session=1 COLD probe_n=%d dt_ms=%d — drained",
+					n, dt.Milliseconds())
 				continue
 			}
-			committed = true
-			log.Printf("session=%d HOT probe_n=%d dt_ms=%d — committed",
-				sessions, n, dt.Milliseconds())
+			log.Printf("session=1 HOT probe_n=%d dt_ms=%d — passthrough",
+				n, dt.Milliseconds())
 			if _, werr := os.Stdout.Write(probe[:n]); werr != nil {
 				resp.Body.Close()
 				return

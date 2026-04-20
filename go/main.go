@@ -9,10 +9,10 @@
 // deeplink HDMI junk — discard to EOF and let session 2 be the
 // first real stream.
 //
-// Between sessions we write one 188-byte NULL TS packet. Demuxers
-// drop it and it doubles as a stdout-closed tripwire: if the DVR
-// went away, the write fails EPIPE and we exit so AH4C can release
-// the tuner.
+// Every stdout write carries a writeTimeout deadline. Covers both
+// EPIPE (pipe closed) and a stalled reader (pipe buffer fills, Write
+// blocks) — either way the write fails and we exit so AH4C can
+// release the tuner.
 //
 // LinkPi closes TCP every ~5 s by design; reconnecting is normal.
 // Exit only on stdout write failure or encoder dead for deadBudget.
@@ -31,7 +31,34 @@ const (
 	deadBudget     = 30 * time.Second
 	probeBytes     = 32 * 1024
 	probeWindow    = 500 * time.Millisecond
+	writeTimeout   = 10 * time.Second
 )
+
+func writeStdout(p []byte) error {
+	os.Stdout.SetWriteDeadline(time.Now().Add(writeTimeout))
+	_, err := os.Stdout.Write(p)
+	return err
+}
+
+func copyStdout(src io.Reader) (int64, error) {
+	buf := make([]byte, 32*1024)
+	var total int64
+	for {
+		nr, rerr := src.Read(buf)
+		if nr > 0 {
+			if werr := writeStdout(buf[:nr]); werr != nil {
+				return total, werr
+			}
+			total += int64(nr)
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				return total, nil
+			}
+			return total, rerr
+		}
+	}
+}
 
 var nullPacket = func() []byte {
 	p := make([]byte, 188)
@@ -93,28 +120,29 @@ func main() {
 				resp.Body.Close()
 				log.Printf("session=1 COLD probe_n=%d dt_ms=%d — drained",
 					n, dt.Milliseconds())
-				if _, werr := os.Stdout.Write(nullPacket); werr != nil {
+				if werr := writeStdout(nullPacket); werr != nil {
+					log.Printf("stdout closed — exit")
 					return
 				}
 				continue
 			}
 			log.Printf("session=1 HOT probe_n=%d dt_ms=%d — passthrough",
 				n, dt.Milliseconds())
-			if _, werr := os.Stdout.Write(probe[:n]); werr != nil {
+			if werr := writeStdout(probe[:n]); werr != nil {
 				resp.Body.Close()
 				return
 			}
 		}
 
-		n, werr := io.Copy(os.Stdout, resp.Body)
+		n, werr := copyStdout(resp.Body)
 		resp.Body.Close()
 		log.Printf("session=%d bytes=%d werr=%v", sessions, n, werr)
 		if werr != nil {
 			log.Printf("stdout closed — exit")
 			return
 		}
-		if _, werr := os.Stdout.Write(nullPacket); werr != nil {
-			log.Printf("stdout closed on probe — exit")
+		if werr := writeStdout(nullPacket); werr != nil {
+			log.Printf("stdout closed — exit")
 			return
 		}
 	}

@@ -18,13 +18,16 @@
 // encoder's FIN/reconnect-with-~3s-silence pattern produces a PCR jump the
 // in-process reader never caused:
 //
-//   TsProc  — 188-byte-packet-aware wrapper around the byte stream. On
-//             each reconnect, marks `disc_pending`; then flags
-//             adaptation_field.discontinuity_indicator=1 on the first
-//             AF-bearing packet per PID after reconnect. This is the
-//             MPEG-TS primitive for "PCR jumped, rebase STC" — telling
-//             DVR's demuxer the post-reconnect clock is a restart, not a
-//             stale stream. Fixes audio cut / A/V desync on cold tunes.
+//   TsProc  — 188-byte-packet-aware wrapper around the byte stream.
+//             Triggers discontinuity on either (a) TCP reconnect, or
+//             (b) in-stream PCR jump detected per PID. HDMI encoders
+//             keep the HTTP session open across channel changes / HDMI
+//             renegotiates, so TCP reconnect alone misses those events.
+//             On each trigger, emits a synthetic AF-only packet with
+//             discontinuity_indicator=1 ahead of the first real packet
+//             per PID — the MPEG-TS primitive for "PCR restart, rebase
+//             STC". Fixes audio cut / A/V desync on cold tunes AND on
+//             mid-session channel changes.
 //
 // Environment details:
 //   Pipe    — stdout enlarged via fcntl F_SETPIPE_SZ (cascade 8→4→2→1 MiB;
@@ -32,7 +35,7 @@
 //   Teardown— SIGTERM/INT/HUP handler shutdown()s the encoder socket before
 //             _exit so the kernel sends FIN (not RST) to the encoder.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::{ErrorKind, Read, Write};
 use std::mem::ManuallyDrop;
@@ -63,6 +66,12 @@ const MAX_UNHEALTHY: Duration = Duration::from_secs(15);
 const CONNECT: Duration = Duration::from_secs(5);
 const CHUNK: usize = 32 * 1024;
 const QUEUE_DEPTH: usize = 64;
+// PCR is 27 MHz. A jump forward > 500 ms (13.5M ticks) or any backward
+// motion on the same PID is treated as an in-stream discontinuity —
+// independent of whether the TCP connection dropped. HDMI encoders keep
+// the HTTP session open across channel changes and HDMI renegotiates,
+// so this is the only signal that catches those events.
+const PCR_JUMP_FORWARD_TICKS: u64 = 13_500_000;
 
 static STREAM_FD: AtomicI32 = AtomicI32::new(-1);
 
@@ -164,6 +173,7 @@ struct TsProc {
     synced: bool,
     disc_pending: bool,
     flagged_pids: HashSet<u16>,
+    last_pcr: HashMap<u16, u64>,
 }
 
 impl TsProc {
@@ -173,12 +183,35 @@ impl TsProc {
             synced: false,
             disc_pending: false,
             flagged_pids: HashSet::new(),
+            last_pcr: HashMap::new(),
         }
     }
 
-    fn mark_reconnect(&mut self) {
+    fn mark_discontinuity(&mut self, reason: &str) {
+        eprintln!("[us={}] disc_trigger reason={}", us(), reason);
         self.disc_pending = true;
         self.flagged_pids.clear();
+        self.last_pcr.clear();
+    }
+
+    // Parse PCR from a 188-byte TS packet, if present.
+    // AF present when adaptation_field_control bits (packet[3] >> 4) & 0x03
+    // == 0b10 or 0b11. AF length in packet[4]; PCR_flag is bit 0x10 of
+    // packet[5]; PCR base+ext occupies packet[6..12] (33-bit base at 90 kHz
+    // + 9-bit ext at 27 MHz). Result is in 27 MHz ticks.
+    fn extract_pcr(p: &[u8]) -> Option<u64> {
+        if p.len() < 12 { return None; }
+        let af_ctrl = (p[3] >> 4) & 0x03;
+        if af_ctrl != 0b10 && af_ctrl != 0b11 { return None; }
+        if p[4] == 0 { return None; }
+        if (p[5] & 0x10) == 0 { return None; }
+        let base: u64 = ((p[6] as u64) << 25)
+            | ((p[7] as u64) << 17)
+            | ((p[8] as u64) << 9)
+            | ((p[9] as u64) << 1)
+            | ((p[10] as u64) >> 7);
+        let ext: u64 = (((p[10] as u64) & 0x01) << 8) | (p[11] as u64);
+        Some(base * 300 + ext)
     }
 
     fn process(&mut self, data: &[u8]) -> Vec<u8> {
@@ -208,6 +241,23 @@ impl TsProc {
                 }
             }
             let pid = ((self.carry[1] as u16 & 0x1F) << 8) | (self.carry[2] as u16);
+
+            // Detect in-stream PCR jumps (channel change / HDMI renegotiate
+            // without TCP reconnect). Must be evaluated BEFORE maybe_inject_disc
+            // so the synthetic packet lands ahead of the jumped real packet.
+            if let Some(pcr) = Self::extract_pcr(&self.carry[..188]) {
+                if let Some(&prev) = self.last_pcr.get(&pid) {
+                    let jumped = pcr < prev || pcr - prev > PCR_JUMP_FORWARD_TICKS;
+                    if jumped {
+                        self.mark_discontinuity(&format!(
+                            "pcr_jump pid=0x{:04X} prev={} new={}",
+                            pid, prev, pcr
+                        ));
+                    }
+                }
+                self.last_pcr.insert(pid, pcr);
+            }
+
             self.maybe_inject_disc(pid, &mut out);
             out.extend_from_slice(&self.carry[..188]);
             self.carry.drain(..188);
@@ -215,9 +265,9 @@ impl TsProc {
         out
     }
 
-    // On each reconnect, insert a synthetic AF-only packet with
-    // discontinuity_indicator=1 immediately before each PID's first real
-    // post-reconnect packet. This is the MPEG-TS primitive for "PCR
+    // On each discontinuity trigger, insert a synthetic AF-only packet
+    // with discontinuity_indicator=1 immediately before each PID's first
+    // real post-trigger packet. This is the MPEG-TS primitive for "PCR
     // restarted / stream spliced" — the demuxer rebases STC on the NEXT
     // packet of this PID (which is the real packet right after). Doesn't
     // modify real packets, so zero risk of corrupting PES headers or ES
@@ -288,7 +338,7 @@ fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSende
                             stream = s;
                             STREAM_FD.store(stream.as_raw_fd(), Ordering::Relaxed);
                             stream.set_read_timeout(Some(SRC_STALL_RECONNECT)).ok();
-                            tsp.mark_reconnect();
+                            tsp.mark_discontinuity("tcp_reconnect");
                             if !left.is_empty() {
                                 let processed = tsp.process(&left);
                                 if !processed.is_empty() && tx.send(processed).is_err() { return; }

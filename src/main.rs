@@ -194,7 +194,7 @@ impl TsProc {
             }
         }
 
-        let mut out = Vec::with_capacity(self.carry.len());
+        let mut out = Vec::with_capacity(self.carry.len() + 376);
         while self.carry.len() >= 188 {
             if self.carry[0] != 0x47 {
                 self.synced = false;
@@ -207,31 +207,42 @@ impl TsProc {
                     break;
                 }
             }
-            let mut packet: [u8; 188] = [0; 188];
-            packet.copy_from_slice(&self.carry[..188]);
-            self.maybe_flag_disc(&mut packet);
-            out.extend_from_slice(&packet);
+            let pid = ((self.carry[1] as u16 & 0x1F) << 8) | (self.carry[2] as u16);
+            self.maybe_inject_disc(pid, &mut out);
+            out.extend_from_slice(&self.carry[..188]);
             self.carry.drain(..188);
         }
         out
     }
 
-    fn maybe_flag_disc(&mut self, packet: &mut [u8; 188]) {
+    // On each reconnect, insert a synthetic AF-only packet with
+    // discontinuity_indicator=1 immediately before each PID's first real
+    // post-reconnect packet. This is the MPEG-TS primitive for "PCR
+    // restarted / stream spliced" — the demuxer rebases STC on the NEXT
+    // packet of this PID (which is the real packet right after). Doesn't
+    // modify real packets, so zero risk of corrupting PES headers or ES
+    // data; broadcast encoders use this shape at splice points.
+    fn maybe_inject_disc(&mut self, pid: u16, out: &mut Vec<u8>) {
         if !self.disc_pending { return; }
-        let pid = ((packet[1] as u16 & 0x1F) << 8) | (packet[2] as u16);
-        if pid == 0x1FFF { return; }
+        if pid == 0x1FFF { return; }       // NULL packets
+        if pid == 0x0000 { return; }       // PAT — has its own version_number mechanism
         if self.flagged_pids.contains(&pid) { return; }
-        // adaptation_field_control is byte 3 bits 5..4. 10 = AF only,
-        // 11 = AF + payload. Both have an AF we can flag.
-        let af_control = (packet[3] >> 4) & 0x3;
-        if af_control != 0b10 && af_control != 0b11 { return; }
-        let af_length = packet[4];
-        if af_length == 0 { return; }
-        // Byte 5 = AF flags. Bit 7 (0x80) = discontinuity_indicator.
-        packet[5] |= 0x80;
+        out.extend_from_slice(&make_disc_packet(pid));
         self.flagged_pids.insert(pid);
-        eprintln!("[us={}] disc_flag pid=0x{:04X}", us(), pid);
+        eprintln!("[us={}] disc_inject pid=0x{:04X}", us(), pid);
     }
+}
+
+fn make_disc_packet(pid: u16) -> [u8; 188] {
+    let mut p = [0xFFu8; 188];
+    p[0] = 0x47;                                 // sync
+    p[1] = ((pid >> 8) & 0x1F) as u8;            // TEI=0, PUSI=0, TP=0, PID hi 5 bits
+    p[2] = (pid & 0xFF) as u8;                   // PID lo 8 bits
+    p[3] = 0x20;                                 // scrambling=00, af_control=10 (AF only), CC=0
+    p[4] = 183;                                  // AF length: fills bytes 5..188
+    p[5] = 0x80;                                 // AF flags: discontinuity_indicator=1, all else 0
+    // bytes 6..188 remain 0xFF (AF stuffing)
+    p
 }
 
 fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSender<Vec<u8>>) {

@@ -1,8 +1,12 @@
 #!/bin/bash
 # bmitune.sh for osprey/dtvospreydeeplinks
-# Poll the encoder until it's producing bytes — only THEN fire the
-# deep link. Stops the deep link from firing onto a silent encoder
-# and gives the downstream handoff something to chew on right away.
+# Runs async in a goroutine (main.go:216), so it can't gate the
+# handoff. The deep link fire is handled by the nohup'd prober spawned
+# from prebmitune — it fires the deeplink the instant the encoder is
+# producing real video, and survives stopbmitune. All bmitune does
+# here is spawn the keep-alive.
+#
+# AH4C passes:  $1 = channel (name~id)   $2 = tunerIP
 
 channelID=$(echo "$1" | awk -F~ '{print $2}')
 channelName=$(echo "$1" | awk -F~ '{print $1}')
@@ -16,49 +20,6 @@ echo $$ > "$streamerNoPort/bmitune_pid"
 log() { printf '[bmitune %s] %s\n' "$(date '+%H:%M:%S')" "$*" > /proc/1/fd/1; }
 
 trap 'log "exit code=$?"' EXIT
-
-matchEncoderURL() {
-  case "$streamerIP" in
-    "$TUNER1_IP") encoderURL=$ENCODER1_URL ;;
-    "$TUNER2_IP") encoderURL=$ENCODER2_URL ;;
-    "$TUNER3_IP") encoderURL=$ENCODER3_URL ;;
-    "$TUNER4_IP") encoderURL=$ENCODER4_URL ;;
-    "$TUNER5_IP") encoderURL=$ENCODER5_URL ;;
-    "$TUNER6_IP") encoderURL=$ENCODER6_URL ;;
-    "$TUNER7_IP") encoderURL=$ENCODER7_URL ;;
-    "$TUNER8_IP") encoderURL=$ENCODER8_URL ;;
-    "$TUNER9_IP") encoderURL=$ENCODER9_URL ;;
-    *) exit 1 ;;
-  esac
-}
-
-fireDeepLink() {
-  log "firing deep link: $channelName/$channelID → $streamerIP"
-  $adbTarget shell "am start -a android.intent.action.VIEW -d 'https://deeplink.directvnow.com/tune/live/channel/$channelName/$channelID' com.att.tv.openvideo"
-}
-
-# Probe encoder until real video is flowing (>500 KB/s = ~4 Mbps
-# floor for an 8500 VBR tune), then fire the deeplink. Cap at 30
-# probes so we don't hang forever.
-probeAndTune() {
-  [[ -z "$encoderURL" ]] && { log "no encoderURL mapped — firing anyway"; fireDeepLink; return; }
-  log "polling encoder $encoderURL for live bytes before deeplink"
-  local -i i=0
-  while (( i < 30 )); do
-    (( i++ ))
-    local bytes
-    bytes=$(timeout 1 curl -sN "$encoderURL" 2>/dev/null | wc -c)
-    if (( bytes > 500000 )); then
-      log "encoder LIVE on probe $i ($bytes bytes in 1s) — firing deeplink"
-      fireDeepLink
-      return
-    fi
-    log "probe $i teeny ($bytes bytes) — sleep 1"
-    sleep 1
-  done
-  log "TIMEOUT after $i probes — firing deeplink anyway"
-  fireDeepLink
-}
 
 startKeepAlive() {
   cat > "./$streamerNoPort/keep_watching.sh" <<EOF
@@ -75,7 +36,5 @@ EOF
 }
 
 log "start channel=$channelName/$channelID streamerIP=$streamerIP"
-matchEncoderURL
-probeAndTune
 startKeepAlive
 log "done"

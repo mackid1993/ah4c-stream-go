@@ -70,7 +70,7 @@ All values match PR #9's `stallTolerantReader`:
 | `srcReconnectBackoff`  | 2 s    | wait between failed reconnect attempts |
 | `maxUnhealthyDuration` | 15 s   | total no-source-bytes budget before giving up |
 | `chunkSize`            | 32 KiB | read / forward chunk size |
-| `queueDepth`           | 64     | in-flight chunks (~2 MB max buffer) |
+| `queueDepth`           | 2      | in-flight chunks (~64 KiB), matches Perl forked fallback's OS pipe buffer; PR #9 uses 64 because it runs in-process with no extra pipe hop |
 
 ## Attribution
 

@@ -16,10 +16,16 @@
 //                          MPEG-TS NULL packets (PID 0x1FFF) to os.Stdout
 //                          so the HTTP response to DVR keeps making forward
 //                          progress. On real data, writes it through.
-//   chunks channel       — queueDepth = 64 (~2 MiB), shock-absorbs encoder
-//                          bursts so the consumer's 500 ms timer only fires
-//                          during an actual source stall, not on benign
-//                          frame-pacing gaps.
+//   chunks channel       — queueDepth = 2 (~64 KiB). PR #9 uses 64 (~2 MiB)
+//                          because its consumer is AH4C's HTTP handler
+//                          reading directly from the channel — no pipe hop
+//                          between them. Standalone has a stdout pipe to
+//                          AH4C whose 64 KiB kernel buffer already provides
+//                          shock absorption; layering a 2 MiB channel on
+//                          top of that adds ~800 ms of steady-state lag at
+//                          20 Mbps ("running behind live TV"). The Perl
+//                          forked fallback uses the same ~64 KiB pipe-
+//                          buffer behavior and is free of that lag.
 //
 // Timeouts / retry budget (match PR #9):
 //   stallReadGap         = 500ms  — consumer-side NULL injection trigger
@@ -59,7 +65,29 @@ const (
 	maxUnhealthyDuration = 15 * time.Second
 	connectTimeout       = 5 * time.Second
 	chunkSize            = 32 * 1024
-	queueDepth           = 64 // ~2 MiB in-flight, matches PR #9
+	// queueDepth = 2 — the minimum that lets the producer push a new chunk
+	// while the consumer is still writing the previous one (queueDepth=1
+	// serializes them).
+	//
+	// The math: at 20 Mbps, one 32 KiB chunk is ~12.5 ms of video, so the
+	// channel caps latency at queueDepth * 12.5 ms:
+	//   queueDepth=2   →  25 ms max
+	//   queueDepth=8   → 100 ms max
+	//   queueDepth=16  → 200 ms max
+	//   queueDepth=64  → 800 ms max   (PR #9's value; "behind live TV")
+	//
+	// PR #9 uses 64 because its consumer is AH4C's HTTP handler reading
+	// directly from the channel — no pipe hop, so the channel is doing
+	// all the pipeline's burst shock absorption.
+	//
+	// Standalone is different. The pipeline downstream of this channel
+	// already has ~300 KiB (~120 ms at 20 Mbps) of legitimate buffering:
+	// Linux pipe (64 KiB) + AH4C's io.Copy (32 KiB) + HTTP ResponseWriter
+	// bufio (4 KiB) + DVR TCP send buffer (~200 KiB). Those absorb real
+	// encoder burstiness on their own; our channel doesn't need to do
+	// that job again. Anything we hold in the channel is pure additional
+	// latency between encoder and DVR.
+	queueDepth = 2
 )
 
 // 174 × 188-byte TS NULL packets = 32,712 bytes (≤ 32 KiB).

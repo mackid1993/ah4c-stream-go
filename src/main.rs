@@ -11,7 +11,9 @@
 
 use std::env;
 use std::io::{ErrorKind, Read, Write};
+use std::mem::ManuallyDrop;
 use std::net::{TcpStream, ToSocketAddrs};
+use std::os::unix::io::FromRawFd;
 use std::process::exit;
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::thread;
@@ -39,8 +41,11 @@ fn main() {
 
 fn consumer(rx: Receiver<Vec<u8>>) {
     let null = make_null();
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
+    // Bypass std::io::stdout()'s LineWriter — it buffers binary data (no \n)
+    // up to 8 KiB, adding read-size-dependent latency. Raw fd 1 goes straight
+    // to write(2) per call, same as Perl's syswrite. ManuallyDrop so the
+    // File's Drop doesn't close fd 1 on scope exit.
+    let mut out = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(1) });
     loop {
         match rx.recv_timeout(STALL_READ_GAP) {
             Ok(data) => {

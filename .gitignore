@@ -1,4 +1,5 @@
-# Built binaries
+# Rust build output
+/target
 /ah4c-stream
 /ah4c-stream-amd64
 /ah4c-stream-arm64

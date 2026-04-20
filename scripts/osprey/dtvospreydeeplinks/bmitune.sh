@@ -50,7 +50,7 @@ probeAndTune() {
     (( i++ ))
     local bytes
     bytes=$(timeout 1 curl -sN "$encoderURL" 2>/dev/null | wc -c)
-    if (( bytes > 10000 )); then
+    if (( bytes > 500000 )); then
       if $cold; then
         log "encoder woke on probe $i ($bytes bytes) — cold path, sleep 1 before fire"
         sleep 1

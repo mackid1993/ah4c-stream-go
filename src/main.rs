@@ -8,14 +8,16 @@
 //              reconnects silently with 2s backoff. No NULL emission here.
 //   Consumer — forwards channel bytes to stdout. On 500ms channel-empty
 //              (stallReadGap), fills with MPEG-TS NULL packets ONLY when
-//              the producer is actually stalled (in the reconnect branch
-//              or waiting for first real bytes post-reconnect). VBR/low-
-//              activity encoders can leave the channel empty for >500ms
-//              between chunks while healthy; padding those gaps adds
-//              PCR-less bytes to DVR's buffer, pushes the live edge
-//              backward, and corrupts audio PTS alignment. Diverges from
-//              PR #9 because CMD-mode topology inherits upstream VBR jitter
-//              the in-process reader never saw.
+//              LAST_REAL_DATA_US is older than STALE_DATA_MS (1.5 s).
+//              VBR/low-activity encoders can leave the channel empty for
+//              >500 ms between chunks while healthy; padding those gaps
+//              adds PCR-less bytes to DVR's buffer, pushes the live edge
+//              backward, and corrupts audio PTS alignment. The time-based
+//              gate also covers the pre-reconnect silence window (producer
+//              blocked in stream.read up to SRC_STALL_RECONNECT=5s), where
+//              an in-reconnect-branch flag would leave DVR dark.
+//              Diverges from PR #9 because CMD-mode topology inherits
+//              upstream VBR jitter the in-process reader never saw.
 //   Channel  — sync_channel(64), matching PR #9.
 //
 // Beyond PR #9 — required because CMD-mode topology (extra kernel pipe +
@@ -47,7 +49,7 @@ use std::mem::ManuallyDrop;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::process::exit;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::OnceLock;
 use std::thread;
@@ -77,17 +79,25 @@ const QUEUE_DEPTH: usize = 64;
 // the HTTP session open across channel changes and HDMI renegotiates,
 // so this is the only signal that catches those events.
 const PCR_JUMP_FORWARD_TICKS: u64 = 13_500_000;
+// How long the source may be silent before we start padding DVR's pipe
+// with NULL packets. Chosen to tolerate VBR burstiness (even at 50 KB/s
+// the gap between chunks is ~640 ms) while reacting long before DVR's
+// demuxer gives up. Covers BOTH the pre-reconnect silence window (up to
+// SRC_STALL_RECONNECT = 5 s the producer is blocked in stream.read) AND
+// the reconnect + post-reconnect-pre-first-byte window. Single threshold
+// replaces the previous "producer in reconnect branch" flag, which left
+// the pre-reconnect 5 s silent — that silence was the remaining cause
+// of audio desync / falling behind live.
+const STALE_DATA_MS: u64 = 1500;
 
 static STREAM_FD: AtomicI32 = AtomicI32::new(-1);
 
-// True while the producer is either in its reconnect loop or has just
-// reconnected and hasn't yet received real bytes on the new socket.
-// Consumer uses this to gate NULL injection: only pad DVR's pipe when
-// the source is actually broken, not when it's just emitting VBR bursts
-// with sub-500ms gaps. Padding during healthy-but-bursty periods inflates
-// DVR's buffer with packets carrying no PCR, pushing the live edge
-// further behind each cycle and confusing audio PTS alignment.
-static PRODUCER_STALLED: AtomicBool = AtomicBool::new(false);
+// Wall-clock us() of the last successful source read. Consumer reads
+// this on each 500 ms timeout tick and injects NULLs only when the gap
+// exceeds STALE_DATA_MS. Bursty traffic never reaches the threshold;
+// genuine stalls (encoder frozen, HDMI renegotiating, TCP reconnecting)
+// always do.
+static LAST_REAL_DATA_US: AtomicU64 = AtomicU64::new(0);
 
 extern "C" fn on_term(_: libc::c_int) {
     let fd = STREAM_FD.load(Ordering::Relaxed);
@@ -174,13 +184,15 @@ fn consumer(rx: Receiver<Vec<u8>>) {
                 BYTES_WRITTEN.fetch_add(n as u64, Ordering::Relaxed);
             }
             Err(RecvTimeoutError::Timeout) => {
-                // Pad only while the producer is actually stalled/reconnecting.
-                // Bursty VBR encoders can leave the channel empty for >500ms
-                // between chunks while perfectly healthy — padding those gaps
-                // inflates DVR's buffer with PCR-less packets, shoves the live
-                // edge backward, and breaks audio PTS alignment.
-                if PRODUCER_STALLED.load(Ordering::Relaxed) {
-                    eprintln!("[us={}] null_inject (producer stalled)", us());
+                // Inject NULLs only when the source has actually been silent
+                // longer than STALE_DATA_MS. Bursty VBR gaps are well under
+                // that; real stalls (encoder frozen, HDMI renegotiating, TCP
+                // reconnecting) always cross it within ~1.5 s of going quiet.
+                let now = us();
+                let last = LAST_REAL_DATA_US.load(Ordering::Relaxed);
+                let gap_ms = now.saturating_sub(last) / 1000;
+                if gap_ms > STALE_DATA_MS {
+                    eprintln!("[us={}] null_inject gap_ms={}", now, gap_ms);
                     if out.write_all(&null).is_err() { return; }
                 }
             }
@@ -323,6 +335,7 @@ fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSende
     if !leftover.is_empty() {
         let n = leftover.len();
         BYTES_READ.fetch_add(n as u64, Ordering::Relaxed);
+        LAST_REAL_DATA_US.store(us(), Ordering::Relaxed);
         eprintln!("[us={}] prod_leftover n={}", us(), n);
         let processed = tsp.process(&leftover);
         if !processed.is_empty() && tx.send(processed).is_err() { return; }
@@ -341,10 +354,7 @@ fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSende
                 }
                 BYTES_READ.fetch_add(n as u64, Ordering::Relaxed);
                 last_real = Instant::now();
-                if PRODUCER_STALLED.load(Ordering::Relaxed) {
-                    PRODUCER_STALLED.store(false, Ordering::Relaxed);
-                    eprintln!("[us={}] source flowing (stall cleared)", us());
-                }
+                LAST_REAL_DATA_US.store(us(), Ordering::Relaxed);
                 let t_s = Instant::now();
                 let processed = tsp.process(&buf[..n]);
                 if !processed.is_empty() && tx.send(processed).is_err() { return; }
@@ -356,7 +366,6 @@ fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSende
             }
             _ => {
                 eprintln!("[us={}] source idle/error; reconnecting", us());
-                PRODUCER_STALLED.store(true, Ordering::Relaxed);
                 loop {
                     if last_real.elapsed() > MAX_UNHEALTHY { return; }
                     match connect(&url) {
@@ -366,6 +375,7 @@ fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSende
                             stream.set_read_timeout(Some(SRC_STALL_RECONNECT)).ok();
                             tsp.mark_discontinuity("tcp_reconnect");
                             if !left.is_empty() {
+                                LAST_REAL_DATA_US.store(us(), Ordering::Relaxed);
                                 let processed = tsp.process(&left);
                                 if !processed.is_empty() && tx.send(processed).is_err() { return; }
                             }

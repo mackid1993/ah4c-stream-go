@@ -233,11 +233,13 @@ fn connect(url: &str) -> std::io::Result<(TcpStream, Vec<u8>)> {
 }
 
 fn make_null() -> Vec<u8> {
-    let mut v = Vec::with_capacity(174 * 188);
-    for _ in 0..174 {
-        v.extend_from_slice(&[0x47, 0x1F, 0xFF, 0x10]);
-        v.extend(std::iter::repeat(0xFF).take(184));
-    }
+    // Single 188-byte NULL packet per 500ms stall event. Minimum viable
+    // keepalive — enough for DVR to see forward progress on the HTTP body,
+    // negligible pipe-depth cost vs the 32 KiB chunk v0.2.12 emitted, which
+    // filled the stdout pipe ahead of real data during cold-start trickle.
+    let mut v = Vec::with_capacity(188);
+    v.extend_from_slice(&[0x47, 0x1F, 0xFF, 0x10]);
+    v.extend(std::iter::repeat(0xFF).take(184));
     v
 }
 

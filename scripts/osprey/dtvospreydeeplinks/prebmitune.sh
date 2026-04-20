@@ -2,7 +2,6 @@
 # prebmitune.sh for osprey/dtvospreydeeplinks
 # Waits for the HDMI encoder to actually be serving a live stream before
 # letting AH4C's tune() return. Prevents the cold-start trickle/FIN cycle.
-set -x
 
 streamerIP="$1"
 streamerNoPort="${streamerIP%%:*}"
@@ -10,7 +9,9 @@ adbTarget="adb -s $streamerIP"
 
 mkdir -p "$streamerNoPort"
 
-trap 'echo "prebmitune.sh exiting for $streamerIP with exit code $?"' EXIT
+log() { printf '[prebmitune %s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
+
+trap 'log "exit code=$?"' EXIT
 
 matchEncoderURL() {
   case "$streamerIP" in
@@ -27,36 +28,53 @@ matchEncoderURL() {
 }
 
 adbConnect() {
-  adb connect "$streamerIP"
+  adb connect "$streamerIP" >/dev/null
   local -i tries=0
   while true; do
-    $adbTarget shell input keyevent KEYCODE_WAKEUP && break
-    (( tries++ >= 3 )) && { touch "$streamerNoPort/adbCommunicationFail"; exit 2; }
+    if $adbTarget shell input keyevent KEYCODE_WAKEUP >/dev/null 2>&1; then
+      log "adb wake ok ($streamerIP)"
+      return
+    fi
+    if (( tries++ >= 3 )); then
+      touch "$streamerNoPort/adbCommunicationFail"
+      log "adb wake FAILED after $tries tries — giving up"
+      exit 2
+    fi
+    log "adb wake retry $tries"
   done
 }
 
-# Sample 2s of the encoder. If it delivers <500 KB, it's trickling (cold).
-# Retry until stable or timeout. The encoder stays hot across brief client
-# cycles because the Fire TV is holding the HDMI signal, so our probe
-# doesn't destabilize it.
+# Poll the encoder with 2s curl samples. If <500 KB arrives, encoder is
+# cold/trickling — wait and retry. When ≥500 KB arrives, encoder is
+# serving stable HD-rate data and we can let tune() proceed.
 waitForEncoder() {
   matchEncoderURL
-  [[ -z "$encoderURL" ]] && return
-  local -i waited=0
+  if [[ -z "$encoderURL" ]]; then
+    log "no encoderURL mapped for $streamerIP — skipping check"
+    return
+  fi
+  log "waiting for encoder $encoderURL"
+  local -i waited=0 probe=0
   while (( waited < 30 )); do
+    (( probe++ ))
     local bytes
     bytes=$(timeout 2 curl -sN "$encoderURL" 2>/dev/null | head -c 1000000 | wc -c)
-    (( bytes >= 500000 )) && { echo "Encoder ready ($bytes bytes in 2s)"; return; }
-    echo "Encoder cold ($bytes bytes in 2s), retrying"
+    if (( bytes >= 500000 )); then
+      log "encoder READY on probe $probe ($bytes bytes in 2s)"
+      return
+    fi
+    log "probe $probe cold ($bytes bytes in 2s), waiting 1s"
     sleep 1
     (( waited += 3 ))
   done
-  echo "Encoder readiness timeout; proceeding"
+  log "encoder readiness TIMEOUT after ${waited}s — proceeding anyway"
 }
 
 main() {
+  log "start streamerIP=$streamerIP"
   adbConnect
   waitForEncoder
+  log "done"
 }
 
 main

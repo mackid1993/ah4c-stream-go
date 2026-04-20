@@ -37,8 +37,15 @@
 //             mid-session channel changes.
 //
 // Environment details:
-//   Pipe    — stdout enlarged via fcntl F_SETPIPE_SZ (cascade 8→4→2→1 MiB;
-//             container caps at 1 MiB without CAP_SYS_RESOURCE).
+//   Pipe    — stdout kept at Linux default (~64 KiB). Earlier versions
+//             enlarged via F_SETPIPE_SZ to absorb AH4C's ~1s io.Copy
+//             startup pause, but that 1 MiB fill becomes a fixed startup
+//             prebuffer DVR sees as end-to-end latency. PR #9's in-process
+//             io.Pipe is a rendezvous (~0 buffer); removing the cascade
+//             brings us closer to that profile. Producer still has
+//             sync_channel(64) = 2 MiB of shock absorption; if AH4C's
+//             startup pause exceeds the channel, producer backpressures
+//             the encoder's TCP send buffer rather than filling the pipe.
 //   Teardown— SIGTERM/INT/HUP handler shutdown()s the encoder socket before
 //             _exit so the kernel sends FIN (not RST) to the encoder.
 
@@ -159,18 +166,8 @@ fn summary_thread() {
 fn consumer(rx: Receiver<Vec<u8>>) {
     let null = make_null();
     let mut out = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(1) });
-    unsafe {
-        for size in [8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 1024 * 1024].iter() {
-            if libc::fcntl(1, 1031, *size as libc::c_int) >= 0 {
-                let actual = libc::fcntl(1, 1032);
-                eprintln!("[us={}] pipe_sz requested={} actual={}", us(), size, actual);
-                break;
-            } else {
-                let err = std::io::Error::last_os_error();
-                eprintln!("[us={}] pipe_sz requested={} DENIED err={}", us(), size, err);
-            }
-        }
-    }
+    let actual = unsafe { libc::fcntl(1, 1032) };
+    eprintln!("[us={}] pipe_sz default={}", us(), actual);
     loop {
         match rx.recv_timeout(STALL_READ_GAP) {
             Ok(data) => {
@@ -417,18 +414,16 @@ fn connect(url: &str) -> std::io::Result<(TcpStream, Vec<u8>)> {
     Ok((stream, leftover))
 }
 
-// Single 188-byte NULL packet. PR #9's 174-packet (32 KiB) chunk works
-// in-process, but in CMD-mode every NULL written to stdout propagates
-// through the kernel pipe + AH4C's io.Pipe ahead of the real post-stall
-// content — bytes downstream consumers must chew through before
-// catching up. At 500 ms tick × 174 packets × N stalls per tune, that
-// accumulates into seconds of perceived live-edge drift. One packet per
-// tick is enough to keep the pipe from looking dead to AH4C's reader
-// while contributing ~376 B/s of pure overhead, not 64 KB/s.
+// 174 × 188 B = 32,712 B ≈ 32 KiB. Matches PR #9 exactly. v0.2.22
+// shrank this to one packet to cut timeline drift but broke cold-start
+// and audio — AH4C and/or DVR evidently needs a meaningful byte volume
+// per tick to treat the stream as live. Restoring the PR #9 size.
 fn make_null() -> Vec<u8> {
-    let mut v = Vec::with_capacity(188);
-    v.extend_from_slice(&[0x47, 0x1F, 0xFF, 0x10]);
-    v.extend(std::iter::repeat(0xFF).take(184));
+    let mut v = Vec::with_capacity(174 * 188);
+    for _ in 0..174 {
+        v.extend_from_slice(&[0x47, 0x1F, 0xFF, 0x10]);
+        v.extend(std::iter::repeat(0xFF).take(184));
+    }
     v
 }
 

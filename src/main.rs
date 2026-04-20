@@ -25,10 +25,24 @@ use std::mem::ManuallyDrop;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::process::exit;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
+
+// ---------- diagnostic instrumentation (v0.2.6) ----------
+static T0: OnceLock<Instant> = OnceLock::new();
+static BYTES_READ: AtomicU64 = AtomicU64::new(0);
+static BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
+static PROD_BLOCKED_US: AtomicU64 = AtomicU64::new(0);
+static CONS_BLOCKED_US: AtomicU64 = AtomicU64::new(0);
+static SLOW_EVENT_MS: u64 = 10;
+
+fn us() -> u64 {
+    T0.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+// ---------------------------------------------------------
 
 const STALL_READ_GAP: Duration = Duration::from_millis(500);
 const SRC_STALL_RECONNECT: Duration = Duration::from_secs(5);
@@ -59,16 +73,42 @@ fn install_signal_handler() {
 
 fn main() {
     install_signal_handler();
+    let _ = T0.set(Instant::now());
+    eprintln!("[us={}] start pid={}", us(), std::process::id());
+
     let url = env::args().nth(1).unwrap_or_else(|| { eprintln!("usage: ah4c-stream <url>"); exit(2) });
+    let t_conn = Instant::now();
     let (stream, leftover) = connect(&url).unwrap_or_else(|e| {
         eprintln!("initial connect failed: {}", e); exit(2)
     });
+    eprintln!("[us={}] connect ok dt_ms={} leftover={}", us(), t_conn.elapsed().as_millis(), leftover.len());
     STREAM_FD.store(stream.as_raw_fd(), Ordering::Relaxed);
 
     let (tx, rx) = sync_channel::<Vec<u8>>(QUEUE_DEPTH);
     let p_url = url.clone();
     thread::spawn(move || producer(p_url, stream, leftover, tx));
+    thread::spawn(summary_thread);
     consumer(rx);
+}
+
+fn summary_thread() {
+    let mut last_r = 0u64;
+    let mut last_w = 0u64;
+    let mut last_pb = 0u64;
+    let mut last_cb = 0u64;
+    loop {
+        thread::sleep(Duration::from_secs(1));
+        let r = BYTES_READ.load(Ordering::Relaxed);
+        let w = BYTES_WRITTEN.load(Ordering::Relaxed);
+        let pb = PROD_BLOCKED_US.load(Ordering::Relaxed);
+        let cb = CONS_BLOCKED_US.load(Ordering::Relaxed);
+        eprintln!(
+            "[us={}] 1s read={} write={} d_read={} d_write={} prod_blocked_ms={} cons_blocked_ms={}",
+            us(), r, w, r - last_r, w - last_w,
+            (pb - last_pb) / 1000, (cb - last_cb) / 1000
+        );
+        last_r = r; last_w = w; last_pb = pb; last_cb = cb;
+    }
 }
 
 fn consumer(rx: Receiver<Vec<u8>>) {
@@ -80,13 +120,27 @@ fn consumer(rx: Receiver<Vec<u8>>) {
     let mut out = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(1) });
     let mut started = false;
     loop {
+        let t_recv = Instant::now();
         match rx.recv_timeout(STALL_READ_GAP) {
             Ok(data) => {
+                let recv_us = t_recv.elapsed().as_micros() as u64;
+                CONS_BLOCKED_US.fetch_add(recv_us, Ordering::Relaxed);
+                if recv_us > SLOW_EVENT_MS * 1000 {
+                    eprintln!("[us={}] cons_recv_slow n={} dt_ms={}", us(), data.len(), recv_us / 1000);
+                }
                 started = true;
+                let n = data.len();
+                let t_w = Instant::now();
                 if out.write_all(&data).is_err() { return; }
+                let w_us = t_w.elapsed().as_micros() as u64;
+                if w_us > SLOW_EVENT_MS * 1000 {
+                    eprintln!("[us={}] cons_write_slow n={} dt_ms={}", us(), n, w_us / 1000);
+                }
+                BYTES_WRITTEN.fetch_add(n as u64, Ordering::Relaxed);
             }
             Err(RecvTimeoutError::Timeout) => {
                 if !started { continue; }
+                eprintln!("[us={}] null_inject (500ms stall)", us());
                 if out.write_all(&null).is_err() { return; }
             }
             Err(RecvTimeoutError::Disconnected) => return,
@@ -97,16 +151,31 @@ fn consumer(rx: Receiver<Vec<u8>>) {
 fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSender<Vec<u8>>) {
     let mut last_real = Instant::now();
     if !leftover.is_empty() {
+        let n = leftover.len();
+        BYTES_READ.fetch_add(n as u64, Ordering::Relaxed);
+        eprintln!("[us={}] prod_leftover n={}", us(), n);
         if tx.send(leftover).is_err() { return; }
     }
     let mut buf = vec![0u8; CHUNK];
     loop {
         if last_real.elapsed() > MAX_UNHEALTHY { return; }
         stream.set_read_timeout(Some(SRC_STALL_RECONNECT)).ok();
+        let t_r = Instant::now();
         match stream.read(&mut buf) {
             Ok(n) if n > 0 => {
+                let r_us = t_r.elapsed().as_micros() as u64;
+                if r_us > SLOW_EVENT_MS * 1000 {
+                    eprintln!("[us={}] prod_read_slow n={} dt_ms={}", us(), n, r_us / 1000);
+                }
+                BYTES_READ.fetch_add(n as u64, Ordering::Relaxed);
                 last_real = Instant::now();
+                let t_s = Instant::now();
                 if tx.send(buf[..n].to_vec()).is_err() { return; }
+                let s_us = t_s.elapsed().as_micros() as u64;
+                PROD_BLOCKED_US.fetch_add(s_us, Ordering::Relaxed);
+                if s_us > SLOW_EVENT_MS * 1000 {
+                    eprintln!("[us={}] prod_send_slow n={} dt_ms={}", us(), n, s_us / 1000);
+                }
             }
             _ => {
                 eprintln!("source idle/error; reconnecting");

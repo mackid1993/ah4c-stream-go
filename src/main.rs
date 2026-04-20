@@ -13,13 +13,19 @@
 //              chunk has been forwarded. Leading NULLs before the stream's
 //              first PAT/PMT desync the DVR demuxer and delay audio lock-on
 //              by ~10s on cold tune.
+//   Teardown — SIGTERM/INT/HUP handler shutdown()s the encoder socket before
+//              _exit(0), so the kernel sends FIN (not RST) to the encoder.
+//              Some encoders enter a degraded state after RST and serve
+//              stale/buffered data on the next connect — manifests as
+//              "second tune falls behind timeline."
 
 use std::env;
 use std::io::{ErrorKind, Read, Write};
 use std::mem::ManuallyDrop;
 use std::net::{TcpStream, ToSocketAddrs};
-use std::os::unix::io::FromRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::process::exit;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,11 +38,32 @@ const CONNECT: Duration = Duration::from_secs(5);
 const CHUNK: usize = 32 * 1024;
 const QUEUE_DEPTH: usize = 2;
 
+static STREAM_FD: AtomicI32 = AtomicI32::new(-1);
+
+extern "C" fn on_term(_: libc::c_int) {
+    let fd = STREAM_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        unsafe { libc::shutdown(fd, libc::SHUT_RDWR); }
+    }
+    unsafe { libc::_exit(0); }
+}
+
+fn install_signal_handler() {
+    let h = on_term as *const () as libc::sighandler_t;
+    unsafe {
+        libc::signal(libc::SIGTERM, h);
+        libc::signal(libc::SIGINT,  h);
+        libc::signal(libc::SIGHUP,  h);
+    }
+}
+
 fn main() {
+    install_signal_handler();
     let url = env::args().nth(1).unwrap_or_else(|| { eprintln!("usage: ah4c-stream <url>"); exit(2) });
     let (stream, leftover) = connect(&url).unwrap_or_else(|e| {
         eprintln!("initial connect failed: {}", e); exit(2)
     });
+    STREAM_FD.store(stream.as_raw_fd(), Ordering::Relaxed);
 
     let (tx, rx) = sync_channel::<Vec<u8>>(QUEUE_DEPTH);
     let p_url = url.clone();
@@ -88,6 +115,7 @@ fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSende
                     match connect(&url) {
                         Ok((s, left)) => {
                             stream = s;
+                            STREAM_FD.store(stream.as_raw_fd(), Ordering::Relaxed);
                             if !left.is_empty() && tx.send(left).is_err() { return; }
                             eprintln!("reconnected");
                             break;

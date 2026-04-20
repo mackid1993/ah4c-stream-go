@@ -37,31 +37,23 @@ fireDeepLink() {
   $adbTarget shell "am start -a android.intent.action.VIEW -d 'https://deeplink.directvnow.com/tune/live/channel/$channelName/$channelID' com.att.tv.openvideo"
 }
 
-# Warm path (encoder already producing bytes on probe 1) — fire deep
-# link immediately. Cold path (encoder dead, had to wait at least one
-# sleep for bytes) — sleep 1 before firing so HDMI is fully stable
-# before we ask Fire TV to change channel. Cap at 30 probes.
+# Probe encoder until real video is flowing (>500 KB/s = ~4 Mbps
+# floor for an 8500 VBR tune), then fire the deeplink. Cap at 30
+# probes so we don't hang forever.
 probeAndTune() {
   [[ -z "$encoderURL" ]] && { log "no encoderURL mapped — firing anyway"; fireDeepLink; return; }
-  log "polling encoder $encoderURL for bytes before deeplink"
+  log "polling encoder $encoderURL for live bytes before deeplink"
   local -i i=0
-  local cold=false
   while (( i < 30 )); do
     (( i++ ))
     local bytes
     bytes=$(timeout 1 curl -sN "$encoderURL" 2>/dev/null | wc -c)
     if (( bytes > 500000 )); then
-      if $cold; then
-        log "encoder woke on probe $i ($bytes bytes) — cold path, sleep 1 before fire"
-        sleep 1
-      else
-        log "encoder hot on probe $i ($bytes bytes) — warm path, firing now"
-      fi
+      log "encoder LIVE on probe $i ($bytes bytes in 1s) — firing deeplink"
       fireDeepLink
       return
     fi
     log "probe $i teeny ($bytes bytes) — sleep 1"
-    cold=true
     sleep 1
   done
   log "TIMEOUT after $i probes — firing deeplink anyway"

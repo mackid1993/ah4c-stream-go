@@ -118,6 +118,18 @@ fn consumer(rx: Receiver<Vec<u8>>) {
     // to write(2) per call, same as Perl's syswrite. ManuallyDrop so the
     // File's Drop doesn't close fd 1 on scope exit.
     let mut out = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(1) });
+    // Enlarge stdout pipe buffer to 1 MiB (default is 64 KiB). AH4C's io.Copy
+    // to DVR blocks for ~1s at startup (per instrumentation in v0.2.6). With a
+    // 64 KiB pipe, that block cascades: our write_all blocks → producer blocks
+    // on tx.send → producer stops reading socket → kernel TCP window closes →
+    // encoder goes silent for ~3s → NULL storm fires every 500 ms → DVR
+    // demuxer resyncs → 10s audio lock-on. 1 MiB absorbs AH4C's startup pause
+    // so nothing cascades. Kernel cap is /proc/sys/fs/pipe-max-size (usually
+    // 1 MiB in containers). Best-effort; ignore failure.
+    // F_SETPIPE_SZ = 1031 (not re-exported by the libc crate on all targets).
+    unsafe {
+        libc::fcntl(1, 1031, 1024 * 1024);
+    }
     let mut started = false;
     loop {
         let t_recv = Instant::now();

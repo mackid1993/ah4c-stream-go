@@ -4,5 +4,9 @@
 /ah4c-stream-amd64
 /ah4c-stream-arm64
 
+# Go build output
+/ah4c-stream-go-amd64
+/ah4c-stream-go-arm64
+
 # macOS noise
 .DS_Store

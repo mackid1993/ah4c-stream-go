@@ -5,9 +5,14 @@
 //              reconnects with 2s backoff. 15s no-real-bytes budget.
 //   Consumer — 500ms channel-empty timer. On data → stdout. On timeout →
 //              MPEG-TS NULL block to stdout (DVR keepalive).
-//   Channel  — sync_channel(64), same as PR #9's queueDepth. Slack so the
-//              producer doesn't TCP-backpressure the encoder on every
-//              consumer blip. Steady-state avg occupancy is near zero.
+//   Channel  — sync_channel(2). PR #9 uses 64 because it's in-process with
+//              DVR; our extra stdout-pipe hop to AH4C already provides shock
+//              absorption via the 64 KiB kernel pipe buffer, so anything
+//              held in this channel is pure added latency.
+//   Cold-path — consumer withholds NULL injection until the first real
+//              chunk has been forwarded. Leading NULLs before the stream's
+//              first PAT/PMT desync the DVR demuxer and delay audio lock-on
+//              by ~10s on cold tune.
 
 use std::env;
 use std::io::{ErrorKind, Read, Write};
@@ -25,7 +30,7 @@ const SRC_RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_UNHEALTHY: Duration = Duration::from_secs(15);
 const CONNECT: Duration = Duration::from_secs(5);
 const CHUNK: usize = 32 * 1024;
-const QUEUE_DEPTH: usize = 64;
+const QUEUE_DEPTH: usize = 2;
 
 fn main() {
     let url = env::args().nth(1).unwrap_or_else(|| { eprintln!("usage: ah4c-stream <url>"); exit(2) });
@@ -46,12 +51,15 @@ fn consumer(rx: Receiver<Vec<u8>>) {
     // to write(2) per call, same as Perl's syswrite. ManuallyDrop so the
     // File's Drop doesn't close fd 1 on scope exit.
     let mut out = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(1) });
+    let mut started = false;
     loop {
         match rx.recv_timeout(STALL_READ_GAP) {
             Ok(data) => {
+                started = true;
                 if out.write_all(&data).is_err() { return; }
             }
             Err(RecvTimeoutError::Timeout) => {
+                if !started { continue; }
                 if out.write_all(&null).is_err() { return; }
             }
             Err(RecvTimeoutError::Disconnected) => return,

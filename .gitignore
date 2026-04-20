@@ -1,0 +1,7 @@
+# Built binaries
+/ah4c-stream
+/ah4c-stream-amd64
+/ah4c-stream-arm64
+
+# macOS noise
+.DS_Store

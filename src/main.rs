@@ -417,12 +417,18 @@ fn connect(url: &str) -> std::io::Result<(TcpStream, Vec<u8>)> {
     Ok((stream, leftover))
 }
 
+// Single 188-byte NULL packet. PR #9's 174-packet (32 KiB) chunk works
+// in-process, but in CMD-mode every NULL written to stdout propagates
+// through the kernel pipe + AH4C's io.Pipe ahead of the real post-stall
+// content — bytes downstream consumers must chew through before
+// catching up. At 500 ms tick × 174 packets × N stalls per tune, that
+// accumulates into seconds of perceived live-edge drift. One packet per
+// tick is enough to keep the pipe from looking dead to AH4C's reader
+// while contributing ~376 B/s of pure overhead, not 64 KB/s.
 fn make_null() -> Vec<u8> {
-    let mut v = Vec::with_capacity(174 * 188);
-    for _ in 0..174 {
-        v.extend_from_slice(&[0x47, 0x1F, 0xFF, 0x10]);
-        v.extend(std::iter::repeat(0xFF).take(184));
-    }
+    let mut v = Vec::with_capacity(188);
+    v.extend_from_slice(&[0x47, 0x1F, 0xFF, 0x10]);
+    v.extend(std::iter::repeat(0xFF).take(184));
     v
 }
 

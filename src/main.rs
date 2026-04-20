@@ -1,83 +1,86 @@
-// ah4c-stream: standalone AH4C CMD-mode tuner. Reads an HDMI encoder's
-// HTTP/1.0 stream and forwards it to stdout (which AH4C pipes to Channels
-// DVR). If the source goes silent for 500 ms, injects MPEG-TS NULL packets
-// so the HTTP response keeps making forward progress. If silent for 5 s,
-// reconnects. If silent for 15 s total, exits so DVR sees EOF and reacts.
+// ah4c-stream: standalone AH4C CMD-mode tuner. Port of PR #9's
+// stallTolerantReader semantics, two-threaded:
+//
+//   Producer — encoder socket; 5s per-read timeout. On timeout or EOF,
+//              reconnects with 2s backoff. 15s no-real-bytes budget.
+//   Consumer — 500ms channel-empty timer. On data → stdout. On timeout →
+//              MPEG-TS NULL block to stdout (DVR keepalive).
+//   Channel  — sync_channel(64), same as PR #9's queueDepth. Slack so the
+//              producer doesn't TCP-backpressure the encoder on every
+//              consumer blip. Steady-state avg occupancy is near zero.
 
 use std::env;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::exit;
-use std::thread::sleep;
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
+use std::thread;
 use std::time::{Duration, Instant};
 
-const STALL: Duration = Duration::from_millis(500);
+const STALL_READ_GAP: Duration = Duration::from_millis(500);
+const SRC_STALL_RECONNECT: Duration = Duration::from_secs(5);
+const SRC_RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
+const MAX_UNHEALTHY: Duration = Duration::from_secs(15);
 const CONNECT: Duration = Duration::from_secs(5);
-const BACKOFF: Duration = Duration::from_secs(2);
-const BUDGET: Duration = Duration::from_secs(15);
-const IDLE_TICKS: u32 = 10; // 10 × 500 ms = 5 s source-idle → reconnect
 const CHUNK: usize = 32 * 1024;
+const QUEUE_DEPTH: usize = 64;
 
 fn main() {
     let url = env::args().nth(1).unwrap_or_else(|| { eprintln!("usage: ah4c-stream <url>"); exit(2) });
+    let (stream, leftover) = connect(&url).unwrap_or_else(|e| {
+        eprintln!("initial connect failed: {}", e); exit(2)
+    });
+
+    let (tx, rx) = sync_channel::<Vec<u8>>(QUEUE_DEPTH);
+    let p_url = url.clone();
+    thread::spawn(move || producer(p_url, stream, leftover, tx));
+    consumer(rx);
+}
+
+fn consumer(rx: Receiver<Vec<u8>>) {
     let null = make_null();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-
-    let (mut stream, leftover) = connect(&url).unwrap_or_else(|e| {
-        eprintln!("initial connect failed: {}", e); exit(2)
-    });
-    if out.write_all(&leftover).is_err() { return; }
-
-    let mut buf = [0u8; CHUNK];
-    let mut last_real = Instant::now();
-    let mut stalls = 0u32;
-
     loop {
-        if last_real.elapsed() >= BUDGET { return; }
-        stream.set_read_timeout(Some(STALL)).ok();
-        match stream.read(&mut buf) {
-            Ok(n) if n > 0 => {
-                if out.write_all(&buf[..n]).is_err() { return; }
-                last_real = Instant::now();
-                stalls = 0;
+        match rx.recv_timeout(STALL_READ_GAP) {
+            Ok(data) => {
+                if out.write_all(&data).is_err() { return; }
             }
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+            Err(RecvTimeoutError::Timeout) => {
                 if out.write_all(&null).is_err() { return; }
-                stalls += 1;
-                if stalls >= IDLE_TICKS {
-                    stream = match reconnect(&url, &null, &mut out, &mut last_real) {
-                        Some(s) => { stalls = 0; s }
-                        None => return,
-                    };
-                }
             }
-            _ => {
-                stream = match reconnect(&url, &null, &mut out, &mut last_real) {
-                    Some(s) => { stalls = 0; s }
-                    None => return,
-                };
-            }
+            Err(RecvTimeoutError::Disconnected) => return,
         }
     }
 }
 
-fn reconnect<W: Write>(url: &str, null: &[u8], out: &mut W, last_real: &mut Instant) -> Option<TcpStream> {
+fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSender<Vec<u8>>) {
+    let mut last_real = Instant::now();
+    if !leftover.is_empty() {
+        if tx.send(leftover).is_err() { return; }
+    }
+    let mut buf = vec![0u8; CHUNK];
     loop {
-        if last_real.elapsed() >= BUDGET { return None; }
-        match connect(url) {
-            Ok((s, leftover)) => {
-                if out.write_all(&leftover).is_err() { return None; }
-                *last_real = Instant::now();
-                eprintln!("reconnected");
-                return Some(s);
+        if last_real.elapsed() > MAX_UNHEALTHY { return; }
+        stream.set_read_timeout(Some(SRC_STALL_RECONNECT)).ok();
+        match stream.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                last_real = Instant::now();
+                if tx.send(buf[..n].to_vec()).is_err() { return; }
             }
-            Err(_) => {
-                let deadline = Instant::now() + BACKOFF;
-                while Instant::now() < deadline {
-                    if last_real.elapsed() >= BUDGET { return None; }
-                    if out.write_all(null).is_err() { return None; }
-                    sleep(STALL);
+            _ => {
+                eprintln!("source idle/error; reconnecting");
+                loop {
+                    if last_real.elapsed() > MAX_UNHEALTHY { return; }
+                    match connect(&url) {
+                        Ok((s, left)) => {
+                            stream = s;
+                            if !left.is_empty() && tx.send(left).is_err() { return; }
+                            eprintln!("reconnected");
+                            break;
+                        }
+                        Err(_) => thread::sleep(SRC_RECONNECT_BACKOFF),
+                    }
                 }
             }
         }
@@ -112,8 +115,6 @@ fn connect(url: &str) -> std::io::Result<(TcpStream, Vec<u8>)> {
 }
 
 fn make_null() -> Vec<u8> {
-    // 174 × 188-byte TS NULL packets = 32,712 bytes (≤ 32 KiB).
-    // sync=0x47, PID=0x1FFF, adaptation=01, CC=0, payload=0xFF.
     let mut v = Vec::with_capacity(174 * 188);
     for _ in 0..174 {
         v.extend_from_slice(&[0x47, 0x1F, 0xFF, 0x10]);

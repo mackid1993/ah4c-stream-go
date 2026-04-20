@@ -54,6 +54,14 @@ const SRC_RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_UNHEALTHY: Duration = Duration::from_secs(15);
 const CONNECT: Duration = Duration::from_secs(5);
 const CHUNK: usize = 32 * 1024;
+// Cap on consecutive NULL emissions when no real data arrives between them.
+// 3 × 32 KiB = 96 KiB of padding per stall cluster — enough to bridge short
+// encoder hiccups at DVR's live rate, short enough that extended silence
+// (like cold-start where encoder sends 1.3s of trickle then pauses 3s) no
+// longer dumps ~512 KiB of NULL into the pipe and starves DVR's audio
+// decoder. Counter resets on any real-data chunk, matching bash's behavior
+// where NULL emission happens only at connection boundaries.
+const MAX_CONSECUTIVE_NULLS: u32 = 3;
 // 256 × 32 KiB = 8 MiB in-process buffer. This is our "fat pipe" since the
 // container caps kernel pipe-max-size at 1 MiB. Channel depth this large only
 // accumulates depth if the consumer can't drain fast enough (i.e. stdout pipe
@@ -140,12 +148,11 @@ fn consumer(rx: Receiver<Vec<u8>>) {
             }
         }
     }
+    let mut nulls_in_a_row: u32 = 0;
     loop {
-        // PR #9's Read(): start fresh 500ms timer, wait for chunk, fill
-        // with NULL packets on timeout. Timer resets each iteration so
-        // NULLs only fire after 500ms of actual channel starvation.
         match rx.recv_timeout(STALL_READ_GAP) {
             Ok(data) => {
+                nulls_in_a_row = 0;
                 let n = data.len();
                 let t_w = Instant::now();
                 if out.write_all(&data).is_err() { return; }
@@ -157,12 +164,13 @@ fn consumer(rx: Receiver<Vec<u8>>) {
             }
             Err(RecvTimeoutError::Timeout) => {
                 if !STARTED.load(Ordering::Relaxed) {
-                    // Cold-start: wait for first real byte before emitting any
-                    // NULL. Demuxer locks onto PAT/PMT cleanly if they arrive
-                    // before any keepalive padding.
                     continue;
                 }
-                eprintln!("[us={}] null_inject (250ms stall)", us());
+                if nulls_in_a_row >= MAX_CONSECUTIVE_NULLS {
+                    continue;
+                }
+                nulls_in_a_row += 1;
+                eprintln!("[us={}] null_inject ({}/{})", us(), nulls_in_a_row, MAX_CONSECUTIVE_NULLS);
                 if out.write_all(&null).is_err() { return; }
             }
             Err(RecvTimeoutError::Disconnected) => return,

@@ -1,15 +1,29 @@
-// ah4c-stream: standalone AH4C CMD-mode tuner that behaviorally mirrors
-// AH4C PR #9's stallTolerantReader, but without wrapping anything in an
-// io.Reader facade. A single pump loop reads from the encoder TCP socket
-// with a 500ms per-read deadline and writes directly to stdout; when the
-// socket is idle it writes a 32 KiB block of MPEG-TS NULL packets (PID
-// 0x1FFF) instead. TS demuxers including Channels DVR drop NULL packets
-// on demux, so they're safe to inject as a keep-alive while the upstream
-// encoder is between bytes.
+// ah4c-stream: standalone AH4C CMD-mode tuner that mirrors AH4C PR #9's
+// stallTolerantReader behavior. Because this is standalone (not wrapped by
+// AH4C's HTTP handler), there's no io.Reader facade to expose: the consumer
+// simply writes os.Stdout directly, and the producer feeds it through a
+// buffered channel — same two-layer split as stallTolerantReader in
+// main.go, without the extra Reader wrapper that would be redundant here.
+//
+// Architecture (maps 1:1 to stallTolerantReader in ah4c/main.go):
+//
+//   Producer goroutine   — owns the encoder socket. Per-read deadline of
+//                          srcStallReconnect (5 s); on timeout/EOF, closes
+//                          the body and enters reconnect-with-backoff.
+//                          Pushes each non-empty read into `chunks`.
+//   Consumer (main)      — pulls from `chunks` with a stallReadGap (500 ms)
+//                          timer. On timer fire, writes a 32 KiB block of
+//                          MPEG-TS NULL packets (PID 0x1FFF) to os.Stdout
+//                          so the HTTP response to DVR keeps making forward
+//                          progress. On real data, writes it through.
+//   chunks channel       — queueDepth = 64 (~2 MiB), shock-absorbs encoder
+//                          bursts so the consumer's 500 ms timer only fires
+//                          during an actual source stall, not on benign
+//                          frame-pacing gaps.
 //
 // Timeouts / retry budget (match PR #9):
-//   stallReadGap         = 500ms  — per-read deadline; on timeout, write NULLs
-//   srcStallReconnect    = 5s     — consecutive no-byte time before reconnect
+//   stallReadGap         = 500ms  — consumer-side NULL injection trigger
+//   srcStallReconnect    = 5s     — producer-side per-read deadline
 //   srcReconnectBackoff  = 2s     — wait between failed reconnect attempts
 //   maxUnhealthyDuration = 15s    — total no-real-bytes time before give-up
 //
@@ -17,7 +31,7 @@
 //   CMD1="./scripts/osprey/dtvospreydeeplinks/ah4c-stream $ENCODER1_URL"
 //
 // Exit codes:
-//   0  - 15s no-source-bytes budget expired, downstream closed, or source EOF
+//   0  - 15s no-source-bytes budget expired, or downstream closed its pipe
 //   2  - bad args, initial connect failed (fails-fast, no leading NULLs),
 //        chunked transfer encoding (HDMI encoders don't use it), non-200
 //
@@ -45,6 +59,7 @@ const (
 	maxUnhealthyDuration = 15 * time.Second
 	connectTimeout       = 5 * time.Second
 	chunkSize            = 32 * 1024
+	queueDepth           = 64 // ~2 MiB in-flight, matches PR #9
 )
 
 // 174 × 188-byte TS NULL packets = 32,712 bytes (≤ 32 KiB).
@@ -90,12 +105,22 @@ func main() {
 		logf("initial connect failed: %v", err)
 		os.Exit(2)
 	}
-	pump(rawURL, conn, br)
+
+	chunks := make(chan []byte, queueDepth)
+	done := make(chan struct{})
+
+	go producer(rawURL, conn, br, chunks, done)
+	consumer(chunks, done)
 }
 
-// pump is the single read/write loop. It owns the connection, the last-real-
-// bytes clock, and the reconnect trigger. No goroutines, no channels.
-func pump(rawURL string, conn net.Conn, br *bufio.Reader) {
+// producer owns the encoder socket and the reconnect loop. It pushes
+// non-empty reads into chunks. On a 5 s per-read timeout or any other read
+// error, it closes the body and reconnects; during the reconnect window the
+// consumer keeps DVR fed with NULL packets. When the 15 s no-real-bytes
+// budget expires (or reconnect is exhausted), it returns; the deferred
+// close(chunks) signals the consumer to exit, which closes done in turn.
+func producer(rawURL string, conn net.Conn, br *bufio.Reader, chunks chan<- []byte, done chan struct{}) {
+	defer close(chunks)
 	defer func() {
 		if conn != nil {
 			conn.Close()
@@ -106,72 +131,93 @@ func pump(rawURL string, conn net.Conn, br *bufio.Reader) {
 	buf := make([]byte, chunkSize)
 
 	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
 		if time.Since(lastReal) >= maxUnhealthyDuration {
-			logf("no source bytes for %v; exiting so DVR sees EOF", maxUnhealthyDuration)
+			logf("no source bytes for %v; closing reader so DVR sees EOF", maxUnhealthyDuration)
 			return
 		}
 
-		_ = conn.SetReadDeadline(time.Now().Add(stallReadGap))
+		_ = conn.SetReadDeadline(time.Now().Add(srcStallReconnect))
 		n, rerr := br.Read(buf)
 
 		if n > 0 {
-			if _, werr := os.Stdout.Write(buf[:n]); werr != nil {
+			data := make([]byte, n)
+			copy(data, buf[:n])
+			select {
+			case chunks <- data:
+			case <-done:
 				return
 			}
 			lastReal = time.Now()
-		}
-		if rerr == nil {
-			continue
-		}
-
-		if ne, ok := rerr.(net.Error); ok && ne.Timeout() {
-			// 500ms passed with no socket bytes — inject NULL keep-alive.
-			if _, werr := os.Stdout.Write(nullChunk); werr != nil {
-				return
-			}
-			if time.Since(lastReal) < srcStallReconnect {
+			if rerr == nil {
 				continue
 			}
-			logf("source idle %v; reconnecting", srcStallReconnect)
-		} else {
-			logf("source error (%v); reconnecting", rerr)
 		}
 
-		conn.Close()
-		conn, br = nil, nil
-		newConn, newBr, cerr := reconnectLoop(rawURL, &lastReal)
-		if cerr != nil {
-			logf("%v", cerr)
-			return
+		// n == 0 OR err != nil after a partial read — close and reconnect.
+		if rerr != nil {
+			if ne, ok := rerr.(net.Error); ok && ne.Timeout() {
+				logf("source idle %v; reconnecting", srcStallReconnect)
+			} else {
+				logf("source error (%v); reconnecting", rerr)
+			}
 		}
-		conn, br = newConn, newBr
+		conn.Close()
+		conn = nil
+
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			if time.Since(lastReal) >= maxUnhealthyDuration {
+				logf("no source bytes for %v during reconnect; closing reader so DVR sees EOF", maxUnhealthyDuration)
+				return
+			}
+			newConn, newBr, cerr := connect(rawURL)
+			if cerr == nil {
+				logf("reconnected")
+				conn, br = newConn, newBr
+				break
+			}
+			logf("reconnect failed: %v", cerr)
+			select {
+			case <-time.After(srcReconnectBackoff):
+			case <-done:
+				return
+			}
+		}
 	}
 }
 
-// reconnectLoop keeps trying to reopen the encoder. NULL packets continue
-// flowing to DVR during each backoff so the HTTP response stays alive. It
-// respects the 15s no-real-bytes budget: once exhausted, pump exits and
-// DVR sees EOF.
-func reconnectLoop(rawURL string, lastReal *time.Time) (net.Conn, *bufio.Reader, error) {
+// consumer pulls chunks from the producer with a 500 ms stall-read timer.
+// Real data → write to os.Stdout. Timer fires (channel empty 500 ms) →
+// write a NULL-packet block so DVR's HTTP response keeps progressing.
+// Producer-closed channel or stdout EPIPE → exit.
+func consumer(chunks <-chan []byte, done chan struct{}) {
+	defer close(done)
 	for {
-		if time.Since(*lastReal) >= maxUnhealthyDuration {
-			return nil, nil, fmt.Errorf("no source bytes for %v during reconnect; exiting", maxUnhealthyDuration)
-		}
-		conn, br, err := connect(rawURL)
-		if err == nil {
-			logf("reconnected")
-			return conn, br, nil
-		}
-		logf("reconnect failed: %v", err)
-		deadline := time.Now().Add(srcReconnectBackoff)
-		for time.Now().Before(deadline) {
+		timer := time.NewTimer(stallReadGap)
+		select {
+		case data, ok := <-chunks:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			if !ok {
+				return
+			}
+			if _, werr := os.Stdout.Write(data); werr != nil {
+				return
+			}
+		case <-timer.C:
 			if _, werr := os.Stdout.Write(nullChunk); werr != nil {
-				return nil, nil, fmt.Errorf("downstream closed")
+				return
 			}
-			if time.Since(*lastReal) >= maxUnhealthyDuration {
-				return nil, nil, fmt.Errorf("no source bytes for %v during backoff; exiting", maxUnhealthyDuration)
-			}
-			time.Sleep(stallReadGap)
 		}
 	}
 }
@@ -225,7 +271,7 @@ func connect(rawURL string) (net.Conn, *bufio.Reader, error) {
 			return nil, nil, fmt.Errorf("chunked transfer encoding not supported")
 		}
 	}
-	// Clear the connect-phase deadline; pump manages per-read deadlines.
+	// Clear the connect-phase deadline; producer manages per-read deadlines.
 	_ = conn.SetDeadline(time.Time{})
 	return conn, br, nil
 }

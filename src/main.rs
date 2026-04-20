@@ -1,21 +1,24 @@
-// ah4c-stream: standalone AH4C CMD-mode tuner. Semantic match to the bash
-// reference (curl + cat-NULL-on-retry); simpler than PR #9's stallTolerantReader.
+// ah4c-stream: standalone AH4C CMD-mode tuner. Literal port of PR #9's
+// stallTolerantReader from sullrich/ah4c (main.go:1337-1529).
 //
-//   Producer — encoder socket. Read with a 1s poll timeout (to allow the
-//              MAX_UNHEALTHY check to run); read-timeouts are non-fatal and
-//              the producer just loops back. On EOF or real I/O error the
-//              producer enters a reconnect loop that emits one NULL chunk
-//              per iteration (matches bash's `cat $NULL_FILE; curl $URL`).
-//   Consumer — forwards channel bytes to stdout (raw fd 1, bypassing
-//              LineWriter). No in-stream NULL injection — NULLs only flow
-//              during the producer's reconnect phase. This avoids the
-//              ~10s audio desync caused by NULL floods interleaved with
-//              cold-start encoder trickle.
-//   Channel  — sync_channel(2). Minimal latency; AH4C's stdin pipe (enlarged
-//              to 1 MiB via fcntl F_SETPIPE_SZ) is the real shock absorber
-//              against AH4C's ~1s startup pause to DVR.
-//   Teardown — SIGTERM/INT/HUP handler shutdown()s the encoder socket before
-//              _exit so the kernel sends FIN (not RST) to the encoder.
+//   Producer — encoder socket. 5s per-read timeout (srcStallReconnect).
+//              On ANY non-data outcome (Ok(0), read timeout, or other I/O
+//              error) the producer closes the body and enters a reconnect
+//              loop that retries silently with 2s backoff — no NULL
+//              emission, producer never writes NULLs.
+//   Consumer — forwards channel bytes to stdout. On 500ms channel-empty
+//              (stallReadGap) fills the output with MPEG-TS NULL packets.
+//              The 500ms timer is created fresh each recv, so NULLs only
+//              fire after 500ms of actual channel starvation.
+//   Channel  — sync_channel(64), same as PR #9's queueDepth. Not a latency
+//              tax: downstream io.Copy drains at DVR's rate, channel stays
+//              near-empty in steady state.
+//   Pipe     — stdout enlarged to 1 MiB via fcntl F_SETPIPE_SZ so AH4C's
+//              ~1s io.Copy startup pause doesn't cascade backpressure to
+//              the encoder.
+//   Teardown — SIGTERM/INT/HUP handler shutdown()s the encoder socket
+//              before _exit so the kernel sends FIN (not RST) to the
+//              encoder.
 
 use std::env;
 use std::io::{ErrorKind, Read, Write};
@@ -24,7 +27,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::process::exit;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -42,12 +45,13 @@ fn us() -> u64 {
 }
 // ---------------------------------------------------------
 
-const READ_POLL: Duration = Duration::from_secs(1);
+const STALL_READ_GAP: Duration = Duration::from_millis(500);
+const SRC_STALL_RECONNECT: Duration = Duration::from_secs(5);
 const SRC_RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_UNHEALTHY: Duration = Duration::from_secs(15);
-const CONNECT: Duration = Duration::from_secs(2);
+const CONNECT: Duration = Duration::from_secs(5);
 const CHUNK: usize = 32 * 1024;
-const QUEUE_DEPTH: usize = 2;
+const QUEUE_DEPTH: usize = 64;
 
 static STREAM_FD: AtomicI32 = AtomicI32::new(-1);
 
@@ -109,16 +113,8 @@ fn summary_thread() {
 }
 
 fn consumer(rx: Receiver<Vec<u8>>) {
-    // Bypass std::io::stdout()'s LineWriter — it buffers binary data (no \n)
-    // up to 8 KiB, adding read-size-dependent latency. Raw fd 1 goes straight
-    // to write(2) per call, same as Perl's syswrite. ManuallyDrop so the
-    // File's Drop doesn't close fd 1 on scope exit.
+    let null = make_null();
     let mut out = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(1) });
-    // Enlarge stdout pipe buffer. AH4C's io.Copy to DVR pauses for ~1s at
-    // startup; a default 64 KiB pipe would force our write_all to block, which
-    // cascades backpressure to the encoder. 1 MiB absorbs the pause. Kernel
-    // caps at /proc/sys/fs/pipe-max-size. F_SETPIPE_SZ = 1031, F_GETPIPE_SZ
-    // = 1032. Try descending sizes; take the largest that's accepted.
     unsafe {
         for size in [8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 1024 * 1024].iter() {
             if libc::fcntl(1, 1031, *size as libc::c_int) >= 0 {
@@ -129,7 +125,10 @@ fn consumer(rx: Receiver<Vec<u8>>) {
         }
     }
     loop {
-        match rx.recv() {
+        // PR #9's Read(): start fresh 500ms timer, wait for chunk, fill
+        // with NULL packets on timeout. Timer resets each iteration so
+        // NULLs only fire after 500ms of actual channel starvation.
+        match rx.recv_timeout(STALL_READ_GAP) {
             Ok(data) => {
                 let n = data.len();
                 let t_w = Instant::now();
@@ -140,14 +139,17 @@ fn consumer(rx: Receiver<Vec<u8>>) {
                 }
                 BYTES_WRITTEN.fetch_add(n as u64, Ordering::Relaxed);
             }
-            Err(_) => return,
+            Err(RecvTimeoutError::Timeout) => {
+                eprintln!("[us={}] null_inject (500ms stall)", us());
+                if out.write_all(&null).is_err() { return; }
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
         }
     }
 }
 
 fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSender<Vec<u8>>) {
     let mut last_real = Instant::now();
-    let null = make_null();
     if !leftover.is_empty() {
         let n = leftover.len();
         BYTES_READ.fetch_add(n as u64, Ordering::Relaxed);
@@ -155,7 +157,7 @@ fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSende
         if tx.send(leftover).is_err() { return; }
     }
     let mut buf = vec![0u8; CHUNK];
-    stream.set_read_timeout(Some(READ_POLL)).ok();
+    stream.set_read_timeout(Some(SRC_STALL_RECONNECT)).ok();
     loop {
         if last_real.elapsed() > MAX_UNHEALTHY { return; }
         let t_r = Instant::now();
@@ -175,34 +177,24 @@ fn producer(url: String, mut stream: TcpStream, leftover: Vec<u8>, tx: SyncSende
                     eprintln!("[us={}] prod_send_slow n={} dt_ms={}", us(), n, s_us / 1000);
                 }
             }
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
-                // Read poll expired — socket alive but no data. Match bash's
-                // curl-blocks-forever: just loop back and keep waiting. The
-                // MAX_UNHEALTHY check at the top of the loop is the safety net.
-                continue;
-            }
             _ => {
-                eprintln!("[us={}] source EOF/error; reconnecting", us());
+                // PR #9: ANY non-data outcome (Ok(0), 5s timeout, real error)
+                // → close body, reconnect silently with 2s backoff. Producer
+                // never emits NULLs; the consumer's 500ms timer handles
+                // DVR keepalive during the channel starvation that results.
+                eprintln!("[us={}] source idle/error; reconnecting", us());
                 loop {
                     if last_real.elapsed() > MAX_UNHEALTHY { return; }
                     match connect(&url) {
                         Ok((s, left)) => {
                             stream = s;
                             STREAM_FD.store(stream.as_raw_fd(), Ordering::Relaxed);
-                            stream.set_read_timeout(Some(READ_POLL)).ok();
+                            stream.set_read_timeout(Some(SRC_STALL_RECONNECT)).ok();
                             if !left.is_empty() && tx.send(left).is_err() { return; }
                             eprintln!("[us={}] reconnected", us());
                             break;
                         }
-                        Err(_) => {
-                            // Emit NULL only after a failed connect attempt — keeps
-                            // DVR fed during real outages, but a fast reconnect
-                            // (encoder glitched for <1s) injects zero NULL bytes
-                            // and the demuxer sees clean continuity.
-                            eprintln!("[us={}] prod_null_emit (reconnect retry)", us());
-                            if tx.send(null.clone()).is_err() { return; }
-                            thread::sleep(SRC_RECONNECT_BACKOFF);
-                        }
+                        Err(_) => thread::sleep(SRC_RECONNECT_BACKOFF),
                     }
                 }
             }

@@ -126,9 +126,17 @@ fn consumer(rx: Receiver<Vec<u8>>) {
     // demuxer resyncs → 10s audio lock-on. 1 MiB absorbs AH4C's startup pause
     // so nothing cascades. Kernel cap is /proc/sys/fs/pipe-max-size (usually
     // 1 MiB in containers). Best-effort; ignore failure.
-    // F_SETPIPE_SZ = 1031 (not re-exported by the libc crate on all targets).
+    // F_SETPIPE_SZ = 1031, F_GETPIPE_SZ = 1032. Try descending sizes; kernel
+    // caps at /proc/sys/fs/pipe-max-size (1 MiB default). Take the largest
+    // that's accepted.
     unsafe {
-        libc::fcntl(1, 1031, 1024 * 1024);
+        for size in [8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 1024 * 1024].iter() {
+            if libc::fcntl(1, 1031, *size as libc::c_int) >= 0 {
+                let actual = libc::fcntl(1, 1032);
+                eprintln!("[us={}] pipe_sz requested={} actual={}", us(), size, actual);
+                break;
+            }
+        }
     }
     let mut started = false;
     loop {

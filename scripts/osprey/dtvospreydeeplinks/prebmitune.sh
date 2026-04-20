@@ -1,7 +1,8 @@
 #!/bin/bash
 # prebmitune.sh for osprey/dtvospreydeeplinks
-# Waits for the HDMI encoder to actually be serving a live stream before
-# letting AH4C's tune() return. Prevents the cold-start trickle/FIN cycle.
+# After ADB wake, probe the encoder for 1s. If the bytes coming through
+# are teeny tiny, the signal isn't live yet — sleep 1 and retry.
+# Exit when packets flow at live-stream rate.
 
 streamerIP="$1"
 streamerNoPort="${streamerIP%%:*}"
@@ -37,37 +38,34 @@ adbConnect() {
     fi
     if (( tries++ >= 3 )); then
       touch "$streamerNoPort/adbCommunicationFail"
-      log "adb wake FAILED after $tries tries — giving up"
+      log "adb wake FAILED after $tries tries"
       exit 2
     fi
-    log "adb wake retry $tries"
   done
 }
 
-# Poll the encoder with 2s curl samples. If <500 KB arrives, encoder is
-# cold/trickling — wait and retry. When ≥500 KB arrives, encoder is
-# serving stable HD-rate data and we can let tune() proceed.
+# Probe encoder for 1s per iteration. If bytes received < threshold,
+# signal isn't live yet — sleep 1 and retry. Safety cap at 30 iterations
+# so a dead encoder can't hang the tune forever.
 waitForEncoder() {
   matchEncoderURL
-  if [[ -z "$encoderURL" ]]; then
-    log "no encoderURL mapped for $streamerIP — skipping check"
-    return
-  fi
-  log "waiting for encoder $encoderURL"
-  local -i waited=0 probe=0
-  while (( waited < 30 )); do
-    (( probe++ ))
+  [[ -z "$encoderURL" ]] && { log "no encoderURL mapped"; return; }
+  local encoderIP="${encoderURL#http://}"
+  encoderIP="${encoderIP%%/*}"
+  log "waiting for live signal on $encoderIP ($encoderURL)"
+  local -i i=0
+  while (( i < 30 )); do
+    (( i++ ))
     local bytes
-    bytes=$(timeout 2 curl -sN "$encoderURL" 2>/dev/null | head -c 1000000 | wc -c)
-    if (( bytes >= 500000 )); then
-      log "encoder READY on probe $probe ($bytes bytes in 2s)"
+    bytes=$(timeout 1 curl -sN "$encoderURL" 2>/dev/null | wc -c)
+    if (( bytes > 100000 )); then
+      log "signal LIVE on probe $i ($bytes bytes in 1s)"
       return
     fi
-    log "probe $probe cold ($bytes bytes in 2s), waiting 1s"
+    log "probe $i teeny ($bytes bytes) — sleep 1"
     sleep 1
-    (( waited += 3 ))
   done
-  log "encoder readiness TIMEOUT after ${waited}s — proceeding anyway"
+  log "TIMEOUT after $i probes — proceeding"
 }
 
 main() {
